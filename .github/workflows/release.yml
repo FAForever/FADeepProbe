@@ -1,0 +1,41 @@
+name: Release
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Setup Compiler
+        run: |
+          curl -L "https://a.tmp.ninja/QGmgtQrR.zip" -o dcc32.zip
+          unzip dcc32.zip
+
+      - name: Compile
+        run: |
+          cd dcc32
+          .\dcc32.exe -W- -H- ..\FADeepProbe.dpr
+
+      - name: Create Draft Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: Release
+          release_name: Release
+          draft: true
+          prerelease: true
+
+      - name: Upload Exe
+        id: upload-exe
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: FADeepProbe.exe
+          asset_name: FADeepProbe.exe
+          asset_content_type: application/vnd.microsoft.portable-executable
