@@ -1,16 +1,21 @@
 name: Release
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release Version'
+        required: true
 
 jobs:
-  build:
+  release:
+    environment: deploy
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v2
 
       - name: Setup Compiler
         run: |
-          curl -L "https://a.tmp.ninja/QGmgtQrR.zip" -o dcc32.zip
+          curl -L ${{ secrets.DELPHI_COMPILER_URL }} -o dcc32.zip
           unzip dcc32.zip
 
       - name: Compile
@@ -24,8 +29,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: Release
-          release_name: Release
+          tag_name: v${{ github.event.inputs.version }}
+          release_name: v${{ github.event.inputs.version }}
           draft: true
           prerelease: true
 
