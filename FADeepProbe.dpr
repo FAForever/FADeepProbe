@@ -140,18 +140,19 @@ begin
   end;
 end;
 
-function HexToUInt(Str:String):NativeUInt;
+function HexToUInt(const Str:String):NativeUInt;
 Var I:Integer;
+    V:Char;
     C:NativeUInt;
 begin
   Result:=0;
   for I:=1 to Length(Str) do
   begin
-    Str[I]:=CharUpper(Str[I]);
-    if (Str[I]>='0') and (Str[I]<='9') then
-      C:=Ord(Str[I])-Ord('0') else
-    if (Str[I]>='A') and (Str[I]<='F') then
-      C:=Ord(Str[I])-Ord('A')+10 else Continue;
+    V:=CharUpper(Str[I]);
+    if (V>='0') and (V<='9') then
+      C:=Ord(V)-Ord('0') else
+    if (V>='A') and (V<='F') then
+      C:=Ord(V)-Ord('A')+10 else Continue;
     Result:=Result shl 4+C;
   end;
 end;
@@ -228,6 +229,24 @@ begin
   end;
   SetLength(StrA,255);
   ReadProcessMemory(PI.hProcess,Ptr,@StrA[1],255,BytesT);
+  Result:=PAnsiChar(@StrA[1]);
+end;
+
+function ReadDebugString(const Data:TOutputDebugStringInfo):String;
+Var BytesT:NativeUInt;
+    Ptr:Pointer;
+    StrW:String;
+    StrA:AnsiString;
+begin
+  Ptr:=Data.lpDebugStringData;
+  if Data.fUnicode<>0 then
+  begin
+    SetLength(StrW,Data.nDebugStringLength);
+    ReadProcessMemory(PI.hProcess,Ptr,@StrW[1],Length(StrW)*SizeOf(Char),BytesT);
+    Exit(PChar(@StrW[1]));
+  end;
+  SetLength(StrA,Data.nDebugStringLength);
+  ReadProcessMemory(PI.hProcess,Ptr,@StrA[1],Length(StrA),BytesT);
   Result:=PAnsiChar(@StrA[1]);
 end;
 
@@ -894,11 +913,18 @@ begin
   ProfilePtr:=HexToUInt(GetCommandLineArg('/p ',True));
 
   Str:=GetCommandLineArg('/log ',False);
+  if (Str<>'') and (Str[1]='"') then
+    Str:=Copy(Str,2,Length(Str)-2);
   if Str='' then
     Str:='Report.txt' else
   if GetFilePath(Str)='' then
     Str:=WorkDir+Str;
   LogFile:=CreateFile(PChar(Str),GENERIC_WRITE,FILE_SHARE_READ or FILE_SHARE_WRITE,nil,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,0);
+  if (LogFile=0) or (LogFile=$FFFFFFFF) then
+  begin
+    MessageBox(0,PChar('CreateFile->'+#13+Str),'Error',MB_ICONERROR);
+    Halt;
+  end;
 
   FillChar(SI,SizeOf(SI),0);
   FillChar(PI,SizeOf(PI),0);
@@ -1006,7 +1032,7 @@ begin
           DbgStrs:=DbgStrs+['EXIT_THREAD: '+IntToStr(DbgEvent.ExitThread.dwExitCode)];
       end;
       OUTPUT_DEBUG_STRING_EVENT: begin
-        DbgStrs:=DbgStrs+[DbgEvent.DebugString.lpDebugStringData];
+        DbgStrs:=DbgStrs+[ReadDebugString(DbgEvent.DebugString)];
       end;
     end;
     ContinueDebugEvent(DbgEvent.dwProcessId,DbgEvent.dwThreadId,DBG_EXCEPTION_NOT_HANDLED);
