@@ -142,17 +142,18 @@ end;
 
 function HexToUInt(const Str:String):NativeUInt;
 Var I:Integer;
-    V:Char;
     C:NativeUInt;
 begin
   Result:=0;
-  for I:=1 to Length(Str) do
+  for I:=Low(Str) to High(Str) do
   begin
-    V:=CharUpper(Str[I]);
-    if (V>='0') and (V<='9') then
-      C:=Ord(V)-Ord('0') else
-    if (V>='A') and (V<='F') then
-      C:=Ord(V)-Ord('A')+10 else Continue;
+    C:=Ord(Str[I]);
+    if C in [48..57] then
+      C:=C-48 else
+    if C in [65..70] then
+      C:=C-55 else
+    if C in [97..102] then
+      C:=C-87 else Continue;
     Result:=Result shl 4+C;
   end;
 end;
@@ -580,18 +581,18 @@ begin
       1: if V=0 then
         Result:=Result+'false' else
         Result:=Result+'true';
-      2: Result:=Result+'LightUserData:'+UIntToHex(V);
-      3: Result:=Result+'Float:'+FloatToStr(PSingle(@V)^,6);
-      4: Result:=Result+'String:'+ReadLuaStr(V);
+      2: Result:=Result+'LightUData:'+UIntToHex(V);
+      3: Result:=Result+FloatToStr(PSingle(@V)^,6);
+      4: Result:=Result+'"'+ReadLuaStr(V)+'"';
       5: begin
         T:=Get_c_object(V);
         if T>0 then
           Result:=Result+'CObject:'+GetCObjectInfo(T) else
           Result:=Result+'Table'; //:'+UIntToHex(V);
       end;
-      6: Result:=Result+'cFunction'; //:'+UIntToHex(V);
-      7: Result:=Result+'Function:'+GetLuaFuncPtStr(V);
-      8: Result:=Result+'UserData:'+UIntToHex(V);
+      6: Result:=Result+'CFunc'; //:'+UIntToHex(V);
+      7: Result:=Result+'Func:'+GetLuaFuncPtStr(V);
+      8: Result:=Result+'UData:'+UIntToHex(V);
       9: Result:=Result+'Thread'; //:'+UIntToHex(V);
     else
       Exit;
@@ -825,7 +826,7 @@ begin
   WriteLog(CmdLine+#13#13);
 
   WriteLog('Exit code: '+IntToStr(ExitCode)+#13);
-  WriteLog('Game version: '+IntToStr(GameVer)+#13);
+  WriteLog('Engine ver.: '+IntToStr(GameVer)+#13);
   WriteLog('Game tick: '+IntToStr(GameTick)+#13);
 
   if MonitorReports<>nil then
@@ -853,9 +854,12 @@ begin
       WriteLog(DbgStrs[I]+#13);
   end;
 
-  WriteLog(#13+'DLLs:');
-  for I:=Low(DLLs) to High(DLLs) do
-    WriteLog(DLLs[I]+#13);
+  if (MonitorReports<>nil) or (AVReports<>nil) or (CPPReports<>nil) then
+  begin
+    WriteLog(#13+'DLLs:');
+    for I:=Low(DLLs) to High(DLLs) do
+      WriteLog(DLLs[I]+#13);
+  end;
 end;
 
 function CloseConsole(dwCtrlType:Cardinal):LongBool;stdcall;
