@@ -428,50 +428,58 @@ begin
   Result:=ReadStr(Ptr,V);
 end;
 
-function Verify_lua_State(lua_State:NativeUInt):Boolean;
-Var BytesT,V:NativeUInt;
+function lStateType(lua_State:NativeUInt):Int32;
+Var BytesT,LPState,V:NativeUInt;
 begin
-  Result:=False;
-  if not ReadProcessMemory(PI.hProcess,Pointer(lua_State+$44),@V,SizeOf(V),BytesT) then Exit;
-  if not ReadProcessMemory(PI.hProcess,Pointer(V),@V,SizeOf(V),BytesT) then Exit;
-  Result:=lua_State=V;
+  Result:=0;
+  if not ReadProcessMemory(PI.hProcess,Pointer(lua_State+$44),@LPState,SizeOf(LPState),BytesT) then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(LPState),@V,SizeOf(V),BytesT) then Exit;
+  if lua_State<>V then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(LPState+$20),@V,SizeOf(V),BytesT) then Exit;
+  if LPState=V then Exit(1);
+  Result:=2;
 end;
 
-function GetLuaCallStr(lua_State,Lvl:NativeUInt):String;
-Var BytesT,Base,Base2,Ptr,V:NativeUInt;
+function GetLuaCallStr(CI:NativeUInt):String;
+Var BytesT,Closure,Proto,Ptr,V:NativeUInt;
 begin
   Result:='';
-  if not ReadProcessMemory(PI.hProcess,Pointer(lua_State+$28),@Base,SizeOf(Base),BytesT) then Exit;
-  Base:=Base+Lvl*5*8;
+  if not ReadProcessMemory(PI.hProcess,Pointer(CI),@Ptr,SizeOf(Ptr),BytesT) then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(Ptr-$4),@Closure,SizeOf(Closure),BytesT) then Exit;
 
-  if not ReadProcessMemory(PI.hProcess,Pointer(Base),@Base2,SizeOf(Base2),BytesT) then Exit;
-  if not ReadProcessMemory(PI.hProcess,Pointer(Base2-$4),@Base2,SizeOf(Base2),BytesT) then Exit;
-  if not ReadProcessMemory(PI.hProcess,Pointer(Base2+$18),@Base2,SizeOf(Base2),BytesT) then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(Ptr-$8),@V,SizeOf(V),BytesT) then Exit;
+  if V=6 then
+  begin
+    if not ReadProcessMemory(PI.hProcess,Pointer(Closure+$10),@V,SizeOf(V),BytesT) then Exit;
+    Exit('@CFunc: 0x'+UIntToHex(V));
+  end;
 
-  if not ReadProcessMemory(PI.hProcess,Pointer(Base2+$20),@Ptr,SizeOf(Ptr),BytesT) then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(Closure+$18),@Proto,SizeOf(Proto),BytesT) then Exit;
+
+  if not ReadProcessMemory(PI.hProcess,Pointer(Proto+$20),@Ptr,SizeOf(Ptr),BytesT) then Exit;
   Result:=ReadLuaStr(Ptr);
   if (Result='') or (Result[1]<>'@') then Exit;
 
-  if not ReadProcessMemory(PI.hProcess,Pointer(Base+$C),@Ptr,SizeOf(Ptr),BytesT) then Exit;
-  if not ReadProcessMemory(PI.hProcess,Pointer(Base2+$C),@Base,SizeOf(Base),BytesT) then Exit;
-  Ptr:=Ptr-Base;
-  if not ReadProcessMemory(PI.hProcess,Pointer(Base2+$14),@Base,SizeOf(Base),BytesT) then Exit;
-  if not ReadProcessMemory(PI.hProcess,Pointer(Ptr+Base),@V,SizeOf(V),BytesT) then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(CI+$C),@Ptr,SizeOf(Ptr),BytesT) then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(Proto+$C),@CI,SizeOf(CI),BytesT) then Exit;
+  Ptr:=Ptr-CI;
+  if not ReadProcessMemory(PI.hProcess,Pointer(Proto+$14),@CI,SizeOf(CI),BytesT) then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(Ptr+CI),@V,SizeOf(V),BytesT) then Exit;
   Result:=Result+' '+IntToStr(V);
 end;
 
-function GetLuaFuncPtStr(FuncPtr:NativeUInt):String;
+function GetLuaFuncPtStr(Closure:NativeUInt):String;
 Var BytesT,Ptr,V:NativeUInt;
 begin
   Result:='';
-  if not ReadProcessMemory(PI.hProcess,Pointer(FuncPtr+$18),@FuncPtr,SizeOf(FuncPtr),BytesT) then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(Closure+$18),@Closure,SizeOf(Closure),BytesT) then Exit;
 
-  if not ReadProcessMemory(PI.hProcess,Pointer(FuncPtr+$20),@Ptr,SizeOf(Ptr),BytesT) then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(Closure+$20),@Ptr,SizeOf(Ptr),BytesT) then Exit;
   if not ReadProcessMemory(PI.hProcess,Pointer(Ptr+$14),@V,SizeOf(V),BytesT) then Exit;
   if Byte(V)<>$40 then Exit;
   Result:=ReadLuaStr(Ptr);
 
-  if not ReadProcessMemory(PI.hProcess,Pointer(FuncPtr+$3C),@V,SizeOf(V),BytesT) then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(Closure+$3C),@V,SizeOf(V),BytesT) then Exit;
   Result:=Result+' '+IntToStr(V);
 end;
 
@@ -564,12 +572,10 @@ begin
     Result:=Result+' BpName:'+Str;
 end;
 
-function GetLuaCallPrmsStr(lua_State:NativeUInt):String;
-Var BytesT,S,E,T,V:NativeUInt;
+function GetLuaCallPrmsStr(S,E:NativeUInt):String;
+Var BytesT,T,V:NativeUInt;
 begin
   Result:='';
-  if not ReadProcessMemory(PI.hProcess,Pointer(lua_State+$8),@E,SizeOf(E),BytesT) then Exit;
-  if not ReadProcessMemory(PI.hProcess,Pointer(lua_State+$C),@S,SizeOf(S),BytesT) then Exit;
   while S<E do
   begin
     if not ReadProcessMemory(PI.hProcess,Pointer(S),@T,SizeOf(T),BytesT) then Exit;
@@ -598,6 +604,35 @@ begin
       Exit;
     end;
     S:=S+8;
+  end;
+end;
+
+function GetCallsReport(lua_State:NativeUInt):String;
+Var S,E,SE,FS,FE:NativeUInt;
+    Str:String;
+begin
+  Result:='';
+  if not ReadProcessMemory(PI.hProcess,Pointer(lua_State+$14),@E,SizeOf(E),BytesT) then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(lua_State+$28),@S,SizeOf(S),BytesT) then Exit;
+  if E<S+$28 then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(lua_State+$8),@SE,SizeOf(SE),BytesT) then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(S),@FS,SizeOf(FS),BytesT) then Exit;
+  if not ReadProcessMemory(PI.hProcess,Pointer(FS+$4),@FS,SizeOf(FS),BytesT) then Exit;
+  Result:=GetLuaFuncPtStr(FS);
+  S:=S+$28;
+  while S<=E do
+  begin
+    if not ReadProcessMemory(PI.hProcess,Pointer(S),@FS,SizeOf(FS),BytesT) then Exit;
+    S:=S+$28;
+    if S<=E then
+    begin
+      if not ReadProcessMemory(PI.hProcess,Pointer(S),@FE,SizeOf(FE),BytesT) then Exit;
+      Str:=GetLuaCallPrmsStr(FS,FE-$8);
+      if Str='' then
+        Str:=GetLuaCallStr(S-$28) else
+        Str:=Str+#13+GetLuaCallStr(S-$28);
+    end else Str:=GetLuaCallPrmsStr(FS,SE);
+    Result:=Result+#13+Str;
   end;
 end;
 
@@ -720,13 +755,16 @@ procedure FindStuff(var Reports:TArray<TEventReport>;const Context:TContext);
   end;
 
   function GetLuaPt(lua_State:NativeUInt):Boolean;
-  Var Str:String;
+  Var SType:Int32;
+      Str:String;
   begin
     Result:=False;
-    if not Verify_lua_State(lua_State) then Exit;
-    Str:=GetLuaCallStr(lua_State,1);
-    if Str='' then Exit;
-    AddEventReport(Reports,'',Str,GetLuaCallPrmsStr(lua_State));
+    SType:=lStateType(lua_State);
+    if SType<1 then Exit;
+    if SType=1 then
+      Str:='Main thread' else Str:='Fork thread';
+    Str:=Str+#13+GetCallsReport(lua_State);
+    AddEventReport(Reports,'',Str,'');
     Result:=True;
   end;
 
@@ -766,15 +804,17 @@ Var ClassName:String;
     I:Int32;
 
   function GetLuaPt(lua_State:NativeUInt):Boolean;
-  Var Pt,Prms:String;
+  Var SType:Int32;
+      Pt:String;
   begin
     Result:=False;
-    if not Verify_lua_State(lua_State) then Exit;
-    Pt:=GetLuaCallStr(lua_State,1);
-    if Pt='' then Prms:='' else
-      Prms:=GetLuaCallPrmsStr(lua_State);
-    AddEventReport(CPPReports,ClassName,Pt,Prms);
-    Result:=(Pt<>'') or (Prms<>'');
+    SType:=lStateType(lua_State);
+    if SType<1 then Exit;
+    if SType=1 then
+      Pt:='Main thread' else Pt:='Fork thread';
+    Pt:=Pt+#13+GetCallsReport(lua_State);
+    AddEventReport(CPPReports,ClassName,Pt,'');
+    Result:=Pt<>'';
   end;
 begin
   ClassName:=GetClassName(SelfPtr);
@@ -985,6 +1025,8 @@ begin
             if ExceptionInformation[0]=0 then
               Str:='ACCESS_VIOLATION: Read from 0x'+UIntToHex(ExceptionInformation[1]) else
               Str:='ACCESS_VIOLATION: Write to 0x'+UIntToHex(ExceptionInformation[1]);
+            if ExceptionAddress=Pointer($95854F) then
+              Str:=Str+'  Out of memory/Alloc error';
             AddEventReport(AVReports,'',Str,'Stacktrace:'+StacktraceToStr([ExceptionAddress]+StackWalk(PDWord(Context.Esp),7)));
             FindStuff(AVReports,Context);
             Str:=GetMiniDumpStr(ExceptionAddress);
