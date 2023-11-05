@@ -929,16 +929,13 @@ end;
 
 begin
   CmdLine:=GetCommandLine;
-
-  I:=1;
-  for I:=I to Length(CmdLine) do
-    if CmdLine[I]<=#32 then Break;
-  for I:=I+1 to Length(CmdLine) do
-    if CmdLine[I]>#32 then Break;
-  if I=Length(CmdLine) then CmdLine:='' else
+  I:=Pos(ParamStr(1),CmdLine);
+  if I<1 then CmdLine:='' else
+    if CmdLine[I-1]='"' then
+    CmdLine:=Copy(CmdLine,I-1) else
     CmdLine:=Copy(CmdLine,I);
 
-  WorkDir:=GetFilePath(Copy(CmdLine,1,Pos(' ',CmdLine)));
+  WorkDir:=GetFilePath(ParamStr(1));
   if WorkDir='' then
     WorkDir:=GetFilePath(CmdLine);
   if WorkDir='' then
@@ -1024,7 +1021,9 @@ begin
               if ReadProcessMemory(PI.hProcess,Pointer(V+$900),@V,SizeOf(V),BytesT) then GameTick:=V;
             if ExceptionInformation[0]=0 then
               Str:='ACCESS_VIOLATION: Read from 0x'+UIntToHex(ExceptionInformation[1]) else
-              Str:='ACCESS_VIOLATION: Write to 0x'+UIntToHex(ExceptionInformation[1]);
+            if ExceptionInformation[0]=1 then
+              Str:='ACCESS_VIOLATION: Write to 0x'+UIntToHex(ExceptionInformation[1]) else
+              Str:='ACCESS_VIOLATION: Execute 0x'+UIntToHex(ExceptionInformation[1]);
             if ExceptionAddress=Pointer($95854F) then
               Str:=Str+'  Out of memory/Alloc error';
             AddEventReport(AVReports,'',Str,'Stacktrace:'+StacktraceToStr([ExceptionAddress]+StackWalk(PDWord(Context.Esp),7)));
