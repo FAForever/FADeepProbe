@@ -932,8 +932,8 @@ begin
   I:=Pos(ParamStr(1),CmdLine);
   if I<1 then CmdLine:='' else
     if CmdLine[I-1]='"' then
-    CmdLine:=Copy(CmdLine,I-1) else
-    CmdLine:=Copy(CmdLine,I);
+      CmdLine:=Copy(CmdLine,I-1) else
+      CmdLine:=Copy(CmdLine,I);
 
   WorkDir:=GetFilePath(ParamStr(1));
   if WorkDir='' then
@@ -1023,7 +1023,7 @@ begin
               Str:='ACCESS_VIOLATION: Read from 0x'+UIntToHex(ExceptionInformation[1]) else
             if ExceptionInformation[0]=1 then
               Str:='ACCESS_VIOLATION: Write to 0x'+UIntToHex(ExceptionInformation[1]) else
-              Str:='ACCESS_VIOLATION: Execute 0x'+UIntToHex(ExceptionInformation[1]);
+              Str:='ACCESS_VIOLATION: Execute at 0x'+UIntToHex(ExceptionInformation[1]);
             if ExceptionAddress=Pointer($95854F) then
               Str:=Str+'  Out of memory/Alloc error';
             AddEventReport(AVReports,'',Str,'Stacktrace:'+StacktraceToStr([ExceptionAddress]+StackWalk(PDWord(Context.Esp),7)));
