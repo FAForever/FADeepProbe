@@ -545,31 +545,56 @@ Var A:TArray<NativeUInt>;
     BytesT,V:NativeUInt;
     Str:String;
     I:Int32;
+
+  function GetBpName(SelfPtr:NativeUInt):String;
+  begin
+    if SelfPtr=0 then
+    begin
+      Result:=' BpName:None';
+      Exit;
+    end;
+    Result:=ReadFAStr(SelfPtr+$8);
+    if Result='' then
+      Result:=' BpName:Wrong' else
+      Result:=' BpName:'+Result;
+  end;
 begin
   Result:=GetClassName(SelfPtr);
   if Result='' then Exit;
   Result:=Demangle(Result);
-  V:=GetTrueCObjectPtr(SelfPtr);
-  A:=[$F6B810,$F8C018];
-  I:=FindAncestor(V,A);
+  SelfPtr:=GetTrueCObjectPtr(SelfPtr);
+  A:=[$F6B810,$F8C018,$F65214,$F6A654];
+  I:=FindAncestor(SelfPtr,A);
   case I of
-    0: SelfPtr:=SelfPtr+$68;
-    1: SelfPtr:=V+$44;
+    0: SelfPtr:=SelfPtr+$70;
+    1: SelfPtr:=SelfPtr+$44;
+    2: begin
+      Result:=Result+GetBpName(SelfPtr);
+      Exit;
+    end;
+    3: begin
+      if not ReadProcessMemory(PI.hProcess,Pointer(SelfPtr+$1C),@V,SizeOf(V),BytesT) then Exit;
+      Result:=Result+#13+'  Owner: '+GetCObjectInfo(V);
+      V:=GetTypeNamePtr(SelfPtr);
+      case V of
+        $F6FD80: begin
+          if not ReadProcessMemory(PI.hProcess,Pointer(SelfPtr+$48),@V,SizeOf(V),BytesT) then Exit;
+          Result:=Result+#13+'  Target: '+GetCObjectInfo(V-4);
+        end;
+        $F6FDCC: begin
+          if not ReadProcessMemory(PI.hProcess,Pointer(SelfPtr+$88),@V,SizeOf(V),BytesT) then Exit;
+          Result:=Result+#13+'  Target: '+GetCObjectInfo(V-4);
+        end;
+      end;
+      Exit;
+    end;
   else
     Exit;
   end;
   if not ReadProcessMemory(PI.hProcess,Pointer(SelfPtr),@V,SizeOf(V),BytesT) then Exit;
   Result:=Result+' ID:'+IntToStr(V);
-  if not ReadProcessMemory(PI.hProcess,Pointer(SelfPtr+$4),@V,SizeOf(V),BytesT) then Exit;
-  if V=0 then
-  begin
-    Result:=Result+' BpName:None';
-    Exit;
-  end;
-  Str:=ReadFAStr(V+$8);
-  if Str='' then
-    Result:=Result+' BpName:Wrong' else
-    Result:=Result+' BpName:'+Str;
+  if not ReadProcessMemory(PI.hProcess,Pointer(SelfPtr+4),@V,SizeOf(V),BytesT) then Exit;
+  Result:=Result+GetBpName(V);
 end;
 
 function GetLuaCallPrmsStr(S,E:NativeUInt):String;
@@ -749,7 +774,7 @@ procedure FindStuff(var Reports:TArray<TEventReport>;const Context:TContext);
   procedure GetClass(SelfPtr:NativeUInt);
   Var Str:String;
   begin
-    Str:=GetClassName(SelfPtr);
+    Str:=GetCObjectInfo(SelfPtr);
     if Str='' then Exit;
     AddEventReport(Reports,Str,'','');
   end;
@@ -762,7 +787,7 @@ procedure FindStuff(var Reports:TArray<TEventReport>;const Context:TContext);
     SType:=lStateType(lua_State);
     if SType<1 then Exit;
     if SType=1 then
-      Str:='Main thread' else Str:='Fork thread';
+      Str:='LUA Main thread' else Str:='LUA Fork thread';
     Str:=Str+#13+GetCallsReport(lua_State);
     AddEventReport(Reports,'',Str,'');
     Result:=True;
@@ -811,7 +836,7 @@ Var ClassName:String;
     SType:=lStateType(lua_State);
     if SType<1 then Exit;
     if SType=1 then
-      Pt:='Main thread' else Pt:='Fork thread';
+      Pt:='LUA Main thread' else Pt:='LUA Fork thread';
     Pt:=Pt+#13+GetCallsReport(lua_State);
     AddEventReport(CPPReports,ClassName,Pt,'');
     Result:=Pt<>'';
