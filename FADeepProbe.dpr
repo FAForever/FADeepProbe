@@ -1051,11 +1051,16 @@ begin
               Str:='ACCESS_VIOLATION: Execute at 0x'+UIntToHex(ExceptionInformation[1]);
             if ExceptionAddress=Pointer($95854F) then
               Str:=Str+'  Out of memory/Alloc error';
-            AddEventReport(AVReports,'',Str,'Stacktrace:'+StacktraceToStr([ExceptionAddress]+StackWalk(PDWord(Context.Esp),7)));
+            Str:=Str+#13
+              +'EAX: 0x'+UIntToHex(Context.Eax)+', EBX: 0x'+UIntToHex(Context.Ebx)+', '
+              +'ECX: 0x'+UIntToHex(Context.Ecx)+', EDX: 0x'+UIntToHex(Context.Edx)+#13
+              +'ESI: 0x'+UIntToHex(Context.Esi)+', EDI: 0x'+UIntToHex(Context.Edi)+', '
+              +'EBP: 0x'+UIntToHex(Context.Ebp)+', ESP: 0x'+UIntToHex(Context.Esp);
+            AddEventReport(AVReports,'',Str+#13,'Stacktrace:'+StacktraceToStr([ExceptionAddress]+StackWalk(PDWord(Context.Esp),7)));
             FindStuff(AVReports,Context);
             Str:=GetMiniDumpStr(ExceptionAddress);
             if Str<>'' then
-              AddEventReport(AVReports,'MiniDump:'+#13+Str,'','');
+              AddEventReport(AVReports,#13+'MiniDump:'+#13+Str,'','');
             DbgActive:=False;
 
             CloseHandle(hThread);
