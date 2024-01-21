@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release Version'
+        description: 'Release Version e.g.: 1.0'
         required: true
 
 jobs:
@@ -11,7 +11,7 @@ jobs:
     environment: deploy
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
       - name: Setup Compiler
         run: |
@@ -23,24 +23,9 @@ jobs:
           cd dcc32
           .\dcc32.exe -W- -H- ..\FADeepProbe.dpr
 
-      - name: Create Draft Release
-        id: create_release
-        uses: actions/create-release@v1
+      - name: Create Pre Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: v${{ github.event.inputs.version }}
-          release_name: v${{ github.event.inputs.version }}
-          draft: true
-          prerelease: true
-
-      - name: Upload Exe
-        id: upload-exe
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: FADeepProbe.exe
-          asset_name: FADeepProbe.exe
-          asset_content_type: application/vnd.microsoft.portable-executable
+          TAG: v${{ github.event.inputs.version }}
+        shell: bash
+        run: gh release create "$TAG" -p --generate-notes FADeepProbe.exe
