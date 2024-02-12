@@ -39,6 +39,8 @@ type
     end;
   end;
 
+  TWineGetVersion=function:PAnsiChar;stdcall;
+
 var
   CmdLine,WorkDir,Str:String;
   SI:TStartupInfo;
@@ -66,6 +68,7 @@ function OpenThread(dwDesiredAccess:DWord;bInheritHandle:Boolean;dwThreadId:DWOR
 function K32EnumProcessModules(hProcess:THandle;lphModule:PHMODULE;cb:DWORD;var lpcbNeeded:DWORD):BOOL;stdcall;external 'kernel32.dll';
 function K32GetModuleInformation(hProcess:THandle;hModule:HMODULE;lpmodinfo:LPMODULEINFO;cb:DWORD):BOOL;stdcall;external 'kernel32.dll';
 function K32GetModuleBaseNameW(hProcess:THandle;hModule:HMODULE;lpBaseName:LPCWSTR;nSize:DWORD):DWORD;stdcall;external 'kernel32.dll';
+function RtlGetVersion(var Info:TOSVersionInfoExW):NTSTATUS;stdcall;external 'ntdll.dll';
 
 function GetEnvVar(const Name:String):String;
 Var Size:UInt32;
@@ -889,6 +892,20 @@ begin
 
   WriteLog('Command line:'+#13);
   WriteLog(CmdLine+#13#13);
+
+  var hNtDll:=GetModuleHandle('ntdll.dll');
+  var WineGetVersion:TWineGetVersion;
+  @WineGetVersion:=GetProcAddress(hNtDll,'wine_get_version');
+  if Assigned(WineGetVersion) then
+    WriteLog('Wine '+WineGetVersion()+#13);
+
+  var VI:TOSVersionInfoExW;
+  FillChar(VI,SizeOf(VI),0);
+  VI.dwOSVersionInfoSize:=SizeOf(VI);
+  RtlGetVersion(VI);
+  WriteLog('Windows '+IntToStr(VI.dwMajorVersion)
+    +'.'+IntToStr(VI.dwMinorVersion)
+    +' (Build '+IntToStr(VI.dwBuildNumber)+')'+#13#13);
 
   WriteLog('Exit code: '+IntToStr(ExitCode)+#13);
   WriteLog('Engine ver.: '+IntToStr(GameVer)+#13);
