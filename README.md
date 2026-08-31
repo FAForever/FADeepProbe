@@ -1,14 +1,16 @@
 # FADeepProbe
-- In the case of a crash replaces Bugsplat.
+- In the case of a crash replaces BugSplat.
 - Integrates with the FA log.
 - Collects a lot more information.
-- It can be placed between the client and the game.
+- Can be placed between the client and the game.
 - Protects the game from attaching a debugger.
-- Allows to collect data around the executable address(/p hex-address)
-- It does not affect performance.
+- Does not affect performance.
 
-It searches FAF locally or the default path.
-
-Or specify the exe of the game via the command line.
-
-The command line is passed to FAF.
+### Usage
+```
+FADeepProbe.exe [exe_path] [/p <hex_address>] [/<game_arg> ...]
+```
+- **`exe_path`**: Path to game executable.
+  - Defaults to `ForgedAlliance.exe` in directory of FADeepProbe or `%ProgramData%\FAForever\bin\ForgedAlliance.exe`
+- **`/p <hex_address>`**: Collect data for Lua calls reaching a specific hex address.
+- **`/<game_arg> ...`**: Arguments passed to the game.
