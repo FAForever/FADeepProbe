@@ -926,11 +926,12 @@ end;
 
 //Lists the hash part of a table: each node with its main position and its raw dwords.
 //Keys that luaH_get can't reach by walking the chain from their main position are marked UNREACHABLE.
+//Nodes with a nil key and a non-nil value, which Lua never creates, are marked NIL KEY.
 function GetLuaTableDumpStr(Ptr:NativeUInt;const T:TLuaTable):String;
 Var Nodes:Array of TLuaNode;
     Readable:Array of Boolean;
     BytesT,Size,Cnt:NativeUInt;
-    I,Main,Cur,Steps,Unreachable:Int32;
+    I,Main,Cur,Steps,Unreachable,NilKeys:Int32;
     P:DWord;
     Line:String;
 
@@ -974,6 +975,7 @@ begin
       Readable[I]:=ReadProcessMemory(PI.hProcess,Pointer(T.Node+NativeUInt(I)*LuaNodeSize),
         @Nodes[I],SizeOf(TLuaNode),BytesT);
   Unreachable:=0;
+  NilKeys:=0;
   for I:=0 to Cnt-1 do
   with Nodes[I] do
   begin
@@ -1011,12 +1013,18 @@ begin
           end;
         end;
       end;
+    end
+    else if ValTT<>0 then
+    begin
+      Line:=Line+' NIL KEY';
+      Inc(NilKeys);
     end;
     Result:=Result+#13+Line+'  {'+UIntToHex(KeyTT)+' '+UIntToHex(KeyV)+' '
       +UIntToHex(ValTT)+' '+UIntToHex(ValV)+' '+UIntToHex(Next)+'}';
   end;
   if Cnt=Size then
     Result:=Result+#13+'Unreachable keys: '+IntToStr(Unreachable);
+  Result:=Result+#13+'Nil keys with values: '+IntToStr(NilKeys);
 end;
 
 //Dumps the Lua tables referenced by the registers and the top 16 stack slots
