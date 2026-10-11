@@ -838,6 +838,228 @@ begin
   end;
 end;
 
+const
+  LTableCodeStart=$926F70; //luaH_mainposition, first function of ltable.c
+  LTableCodeEnd=$927B09;   //End of luaH_setnum, last function of ltable.c
+  LuaNodeSize=$14;
+  MaxDumpNodes=1024;
+
+type
+  TLuaTable=packed record
+    Next:DWord;
+    TT,Marked,Pad1,Pad2:Byte;
+    Flags,LSizeNode,Pad3,Pad4:Byte;
+    Metatable,ArrayPtr,Node,FirstFree,GCList,SizeArray:DWord;
+  end;
+  TLuaNode=packed record
+    KeyTT,KeyV,ValTT,ValV,Next:DWord;
+  end;
+
+//Index of a node pointer in the node array of T, or -1
+function LuaNodeIndex(const T:TLuaTable;P:DWord):Int32;
+begin
+  if (P>=T.Node) and ((P-T.Node) mod LuaNodeSize=0)
+  and ((P-T.Node) div LuaNodeSize<(DWord(1) shl T.LSizeNode)) then
+    Result:=(P-T.Node) div LuaNodeSize else
+    Result:=-1;
+end;
+
+//True if Ptr is readable and has the table type tag
+function ReadLuaTable(Ptr:NativeUInt;out T:TLuaTable):Boolean;
+Var BytesT:NativeUInt;
+begin
+  Result:=ReadProcessMemory(PI.hProcess,Pointer(Ptr),@T,SizeOf(T),BytesT) and (T.TT=5);
+end;
+
+//True if the node array fields of T are consistent
+function IsLuaTableHeaderValid(const T:TLuaTable):Boolean;
+begin
+  Result:=(T.LSizeNode<=24) and (T.Node<>0) and (LuaNodeIndex(T,T.FirstFree)>=0);
+end;
+
+function LuaValueStr(TT,V:DWord):String;
+Var BytesT,Len:NativeUInt;
+begin
+  case TT of
+    0: Result:='nil';
+    1: if V=0 then
+      Result:='false' else
+      Result:='true';
+    2: Result:='LightUData:'+UIntToHex(V);
+    3: Result:=FloatToStr(PSingle(@V)^,6);
+    4: if ReadProcessMemory(PI.hProcess,Pointer(V+$10),@Len,SizeOf(Len),BytesT) and (Len<=64) then
+      Result:='"'+ReadLuaStr(V)+'"' else
+      Result:='String:'+UIntToHex(V);
+    5: Result:='Table:'+UIntToHex(V);
+    6: Result:='CFunc:'+UIntToHex(V);
+    7: Result:='Func:'+UIntToHex(V);
+    8: Result:='UData:'+UIntToHex(V);
+    9: Result:='Thread:'+UIntToHex(V);
+  else
+    Result:='Type'+IntToStr(TT)+':'+UIntToHex(V);
+  end;
+end;
+
+//Node index luaH_mainposition gives the key, or -1 if unknown
+function LuaMainPosition(TT,V:DWord;LSizeNode:Byte):Int32;
+Var BytesT:NativeUInt;
+    Mask,Hash:DWord;
+    F:Single;
+begin
+  Mask:=(DWord(1) shl LSizeNode)-1;
+  case TT of
+    0: Exit(-1);
+    1: Exit(V and Mask);
+    3: begin
+      F:=PSingle(@V)^+1; //Numbers are hashed as key+1.0
+      Hash:=PDWord(@F)^;
+    end;
+    4: begin
+      if not ReadProcessMemory(PI.hProcess,Pointer(V+$C),@Hash,SizeOf(Hash),BytesT) then Exit(-1);
+      Exit(Hash and Mask);
+    end;
+  else
+    Hash:=V;
+  end;
+  Result:=Hash mod (Mask or 1);
+end;
+
+//Lists the hash part of a table: each node with its main position and its raw dwords.
+//Keys that luaH_get can't reach by walking the chain from their main position are marked UNREACHABLE.
+function GetLuaTableDumpStr(Ptr:NativeUInt;const T:TLuaTable):String;
+Var Nodes:Array of TLuaNode;
+    Readable:Array of Boolean;
+    BytesT,Size,Cnt:NativeUInt;
+    I,Main,Cur,Steps,Unreachable:Int32;
+    P:DWord;
+    Line:String;
+
+  function NodePtrStr(P:DWord):String;
+  begin
+    if P=0 then Exit('nil');
+    if LuaNodeIndex(T,P)>=0 then
+      Result:='['+IntToStr(LuaNodeIndex(T,P))+']' else
+      Result:='0x'+UIntToHex(P);
+  end;
+begin
+  Result:='Table 0x'+UIntToHex(Ptr)+', flags 0x'+UIntToHex(T.Flags,True)
+    +', metatable 0x'+UIntToHex(T.Metatable)
+    +', array 0x'+UIntToHex(T.ArrayPtr)+' size '+IntToStr(T.SizeArray)+#13
+    +'Header {';
+  for I:=0 to SizeOf(T) div 4-1 do
+  begin
+    if I>0 then Result:=Result+' ';
+    Result:=Result+UIntToHex(PDWord(PByte(@T)+I*4)^);
+  end;
+  Result:=Result+'}';
+  if (T.LSizeNode>24) or (T.Node=0) then
+    Exit(Result+#13+'Invalid lsizenode or node');
+  Size:=NativeUInt(1) shl T.LSizeNode;
+  Result:=Result+#13+'Node 0x'+UIntToHex(T.Node)+' size '+IntToStr(Size)+', firstfree '+NodePtrStr(T.FirstFree);
+  if LuaNodeIndex(T,T.FirstFree)<0 then
+    Result:=Result+' (outside the node array)';
+  Cnt:=Size;
+  if Cnt>MaxDumpNodes then
+  begin
+    Cnt:=MaxDumpNodes;
+    Result:=Result+#13+'Only the first '+IntToStr(Cnt)+' nodes, chains not checked';
+  end;
+  SetLength(Nodes,Cnt);
+  SetLength(Readable,Cnt);
+  if ReadProcessMemory(PI.hProcess,Pointer(T.Node),@Nodes[0],Cnt*SizeOf(TLuaNode),BytesT) then
+    for I:=0 to Cnt-1 do
+      Readable[I]:=True
+  else //The node array may be partly unmapped, read nodes one by one
+    for I:=0 to Cnt-1 do
+      Readable[I]:=ReadProcessMemory(PI.hProcess,Pointer(T.Node+NativeUInt(I)*LuaNodeSize),
+        @Nodes[I],SizeOf(TLuaNode),BytesT);
+  Unreachable:=0;
+  for I:=0 to Cnt-1 do
+  with Nodes[I] do
+  begin
+    if not Readable[I] then
+    begin
+      Result:=Result+#13+'['+IntToStr(I)+'] unreadable';
+      Continue;
+    end;
+    if (KeyTT=0) and (KeyV=0) and (ValTT=0) and (ValV=0) and (Next=0) then Continue;
+    Line:='['+IntToStr(I)+'] '+LuaValueStr(KeyTT,KeyV)+' = '+LuaValueStr(ValTT,ValV)
+      +', next '+NodePtrStr(Next);
+    if KeyTT<>0 then
+    begin
+      Main:=LuaMainPosition(KeyTT,KeyV,T.LSizeNode);
+      if Main<0 then
+        Line:=Line+', main ?' else
+      begin
+        Line:=Line+', main ['+IntToStr(Main)+']';
+        if Cnt=Size then
+        begin
+          Cur:=Main;
+          Steps:=0;
+          while (Cur>=0) and (Cur<>I) and (Steps<Cnt) do
+          begin
+            P:=Nodes[Cur].Next;
+            if (P=0) or not Readable[Cur] then
+              Cur:=-1 else
+              Cur:=LuaNodeIndex(T,P);
+            Inc(Steps);
+          end;
+          if Cur<>I then
+          begin
+            Line:=Line+' UNREACHABLE';
+            Inc(Unreachable);
+          end;
+        end;
+      end;
+    end;
+    Result:=Result+#13+Line+'  {'+UIntToHex(KeyTT)+' '+UIntToHex(KeyV)+' '
+      +UIntToHex(ValTT)+' '+UIntToHex(ValV)+' '+UIntToHex(Next)+'}';
+  end;
+  if Cnt=Size then
+    Result:=Result+#13+'Unreachable keys: '+IntToStr(Unreachable);
+end;
+
+//Dumps the Lua tables referenced by the registers and the top 16 stack slots
+procedure DumpLuaTables(var Reports:TArray<TEventReport>;const Context:TContext);
+const RegNames:Array[0..6] of String=('EBX','ESI','EDI','EAX','ECX','EDX','EBP');
+Var Ptrs:Array[0..22] of NativeUInt;
+    Done:TArray<NativeUInt>;
+    BytesT:NativeUInt;
+    T:TLuaTable;
+    I:Int32;
+    Name:String;
+
+  function IsDone(Ptr:NativeUInt):Boolean;
+  Var I:Int32;
+  begin
+    for I:=Low(Done) to High(Done) do
+      if Done[I]=Ptr then Exit(True);
+    Result:=False;
+  end;
+begin
+  Ptrs[0]:=Context.Ebx;
+  Ptrs[1]:=Context.Esi;
+  Ptrs[2]:=Context.Edi;
+  Ptrs[3]:=Context.Eax;
+  Ptrs[4]:=Context.Ecx;
+  Ptrs[5]:=Context.Edx;
+  Ptrs[6]:=Context.Ebp;
+  if not ReadProcessMemory(PI.hProcess,Pointer(Context.Esp),@Ptrs[7],16*SizeOf(NativeUInt),BytesT) then
+    FillChar(Ptrs[7],16*SizeOf(NativeUInt),0);
+  Done:=nil;
+  for I:=Low(Ptrs) to High(Ptrs) do
+  begin
+    if IsDone(Ptrs[I]) or not ReadLuaTable(Ptrs[I],T) then Continue;
+    //Registers also show tables with a corrupted header, stack slots only plausible ones
+    if (I>High(RegNames)) and not IsLuaTableHeaderValid(T) then Continue;
+    Done:=Done+[Ptrs[I]];
+    if I<=High(RegNames) then
+      Name:=RegNames[I] else
+      Name:='[ESP+0x'+UIntToHex((I-High(RegNames)-1)*SizeOf(NativeUInt),True)+']';
+    AddEventReport(Reports,#13+'Lua table in '+Name+':'+#13+GetLuaTableDumpStr(Ptrs[I],T),'','');
+  end;
+end;
+
 procedure FindStuff(var Reports:TArray<TEventReport>;const Context:TContext);
   procedure GetClass(SelfPtr:NativeUInt);
   Var Str:String;
@@ -1144,6 +1366,9 @@ begin
             Str:=GetMiniDumpStr(ExceptionAddress);
             if Str<>'' then
               AddEventReport(AVReports,#13+'MiniDump:'+#13+Str,'','');
+            if (NativeUInt(ExceptionAddress)>=LTableCodeStart)
+            and (NativeUInt(ExceptionAddress)<LTableCodeEnd) then
+              DumpLuaTables(AVReports,Context);
             DbgActive:=False;
 
             CloseHandle(hThread);
