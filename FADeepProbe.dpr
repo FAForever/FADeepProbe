@@ -453,7 +453,43 @@ begin
   Result:=2;
 end;
 
-function GetLuaCallStr(CI:NativeUInt):String;
+const
+  LuaVExecuteSEH=$B5CA48; //SEH handler installed by luaV_execute
+
+//luaV_execute keeps the pc of the running Lua function in a local and only
+//stores it to CallInfo.savedpc around calls, so savedpc of the innermost frame is stale.
+//Finds the luaV_execute frame of lua_State through its SEH record on the stack
+//and returns the address of the instruction being executed, or 0.
+function GetLuaExecutePC(lua_State,Esp:NativeUInt):NativeUInt;
+Var Data:Array[0..255] of NativeUInt;
+    BytesT,Ptr,Rec,V:NativeUInt;
+    I,Chunks:Int32;
+begin
+  Result:=0;
+  Ptr:=Esp;
+  for Chunks:=1 to 64 do
+  begin
+    if not ReadProcessMemory(PI.hProcess,Pointer(Ptr),@Data,SizeOf(Data),BytesT) then Exit;
+    for I:=Low(Data) to High(Data) do
+      if Data[I]=LuaVExecuteSEH then
+      begin
+        //push -1; push SEH; push fs:[0] after "and esp,-8", so the record is 0xC below the aligned ebp
+        Rec:=Ptr+NativeUInt(I)*SizeOf(NativeUInt)-4;
+        //L is the first argument, at ebp+8, and ebp is the aligned ebp or 4 above it
+        if not ReadProcessMemory(PI.hProcess,Pointer(Rec+$14),@V,SizeOf(V),BytesT) then Continue;
+        if V<>lua_State then
+          if not ReadProcessMemory(PI.hProcess,Pointer(Rec+$18),@V,SizeOf(V),BytesT)
+          or (V<>lua_State) then Continue;
+        //Locals start 0x5C below the record, the pc of the next instruction is at locals+0x10
+        if not ReadProcessMemory(PI.hProcess,Pointer(Rec-$4C),@V,SizeOf(V),BytesT) then Exit;
+        Exit(V-4);
+      end;
+    Ptr:=Ptr+SizeOf(Data);
+  end;
+end;
+
+//When LivePC is set, PC must be a pc from GetLuaExecutePC: Lua functions without one return ''.
+function GetLuaCallStr(CI:NativeUInt;PC:NativeUInt=0;LivePC:Boolean=False):String;
 Var BytesT,Closure,Proto,Ptr,V:NativeUInt;
 begin
   Result:='';
@@ -466,6 +502,7 @@ begin
     if not ReadProcessMemory(PI.hProcess,Pointer(Closure+$10),@V,SizeOf(V),BytesT) then Exit;
     Exit('@CFunc: 0x'+UIntToHex(V));
   end;
+  if LivePC and (PC=0) then Exit;
 
   if not ReadProcessMemory(PI.hProcess,Pointer(Closure+$18),@Proto,SizeOf(Proto),BytesT) then Exit;
 
@@ -473,9 +510,16 @@ begin
   Result:=ReadLuaStr(Ptr);
   if (Result='') or (Result[1]<>'@') then Exit;
 
-  if not ReadProcessMemory(PI.hProcess,Pointer(CI+$C),@Ptr,SizeOf(Ptr),BytesT) then Exit;
+  if not LivePC then
+    if not ReadProcessMemory(PI.hProcess,Pointer(CI+$C),@PC,SizeOf(PC),BytesT) then Exit;
   if not ReadProcessMemory(PI.hProcess,Pointer(Proto+$C),@CI,SizeOf(CI),BytesT) then Exit;
-  Ptr:=Ptr-CI;
+  Ptr:=PC-CI;
+  if not ReadProcessMemory(PI.hProcess,Pointer(Proto+$30),@V,SizeOf(V),BytesT) then Exit;
+  if Ptr div 4>=V then //pc is not inside this function
+  begin
+    if LivePC then Result:='';
+    Exit;
+  end;
   if not ReadProcessMemory(PI.hProcess,Pointer(Proto+$14),@CI,SizeOf(CI),BytesT) then Exit;
   if not ReadProcessMemory(PI.hProcess,Pointer(Ptr+CI),@V,SizeOf(V),BytesT) then Exit;
   Result:=Result+' '+IntToStr(V);
@@ -645,9 +689,9 @@ begin
   end;
 end;
 
-function GetCallsReport(lua_State:NativeUInt):String;
-Var S,E,SE,FS,FE:NativeUInt;
-    Str:String;
+function GetCallsReport(lua_State,Esp:NativeUInt):String;
+Var S,E,SE,FS,FE,PC:NativeUInt;
+    Str,LineStr:String;
 begin
   Result:='';
   if not ReadProcessMemory(PI.hProcess,Pointer(lua_State+$14),@E,SizeOf(E),BytesT) then Exit;
@@ -669,7 +713,18 @@ begin
       if Str='' then
         Str:=GetLuaCallStr(S-$28) else
         Str:=Str+#13+GetLuaCallStr(S-$28);
-    end else Str:=GetLuaCallPrmsStr(FS,SE);
+    end else
+    begin
+      Str:=GetLuaCallPrmsStr(FS,SE);
+      PC:=0;
+      if ReadProcessMemory(PI.hProcess,Pointer(FS-$8),@FE,SizeOf(FE),BytesT) and (FE=7) then
+        PC:=GetLuaExecutePC(lua_State,Esp);
+      LineStr:=GetLuaCallStr(S-$28,PC,True);
+      if Str='' then
+        Str:=LineStr else
+      if LineStr<>'' then
+        Str:=Str+#13+LineStr;
+    end;
     Result:=Result+#13+Str;
   end;
 end;
@@ -801,7 +856,7 @@ procedure FindStuff(var Reports:TArray<TEventReport>;const Context:TContext);
     if SType<1 then Exit;
     if SType=1 then
       Str:='LUA Main thread' else Str:='LUA Fork thread';
-    Str:=Str+#13+GetCallsReport(lua_State);
+    Str:=Str+#13+GetCallsReport(lua_State,Context.Esp);
     AddEventReport(Reports,'',Str,'');
     Result:=True;
   end;
@@ -850,7 +905,7 @@ Var ClassName:String;
     if SType<1 then Exit;
     if SType=1 then
       Pt:='LUA Main thread' else Pt:='LUA Fork thread';
-    Pt:=Pt+#13+GetCallsReport(lua_State);
+    Pt:=Pt+#13+GetCallsReport(lua_State,Context.Esp);
     AddEventReport(CPPReports,ClassName,Pt,'');
     Result:=Pt<>'';
   end;
