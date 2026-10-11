@@ -15,6 +15,17 @@ FADeepProbe.exe [exe_path] [/p <hex_address>] [/<game_arg> ...]
 - **`/p <hex_address>`**: Collect data for Lua calls reaching a specific hex address.
 - **`/<game_arg> ...`**: Arguments passed to the game.
 
+### Watching Lua table keys
+Lua code can ask FADeepProbe to watch up to 4 string keys of a table with hardware write breakpoints:
+```lua
+pcall(error, "FADeepProbe watch " .. string.gsub(tostring(t), "^table: ", "") .. " key1 key2", 0)
+```
+FA throws Lua errors as C++ exceptions, so FADeepProbe sees the request while the pcall swallows it.
+Writes to a key's type tag from outside Lua's table code appear in the `Watch:` section of the report, with the writer's registers, stack and code.
+Tags that change without a reported write, such as kernel writes, are reported when FADeepProbe polls them.
+
+The `mods/FADeepProbeWatch` UI mod watches the cursor's hotspot keys, which a stray write has been corrupting.
+
 ### Building
 Requires [Free Pascal](https://www.freepascal.org/) 3.2.2 targeting i386-win32. All other compiler settings are in the source.
 ```

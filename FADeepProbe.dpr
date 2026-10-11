@@ -68,7 +68,7 @@ var
   GameTick:UInt32=0;
   DLLs,DbgStrs:TArray<String>;
   MonitorReports,AVReports,CPPReports:TArray<TEventReport>;
-  GameVer,BytesT,V:NativeUInt;
+  GameVer,BytesT:NativeUInt;
 
 const
   THREAD_GET_CONTEXT=$0008;
@@ -1120,6 +1120,229 @@ begin
     if GetLuaPt(Data[I]) then Break;
 end;
 
+//Watches the type tags of chosen string keys of one Lua table with hardware write breakpoints.
+//Lua requests a watch by raising an error inside pcall, which FA throws as a C++ exception:
+//  pcall(error,"FADeepProbe watch <table address> <key> <key>...",0)
+//A write from outside ltable.c means something other than Lua changed the key.
+const
+  WatchMarker:UTF8String='FADeepProbe watch ';
+  WatchPollMs=250;
+  MaxWatchKeys=4; //Debug registers DR0-DR3
+  MaxWatchHits=8;
+  LuaStringTT=4;
+  THREAD_SUSPEND_RESUME=$0002;
+  CONTEXT_DEBUG_REGISTERS=$00010010;
+  ERROR_SEM_TIMEOUT=121;
+
+var
+  ThreadIds:TArray<DWord>;
+  WatchReports:TArray<TEventReport>;
+  WatchTable:NativeUInt=0;
+  WatchNode:DWord=0;
+  WatchKeys:TArray<UTF8String>;
+  WatchAddrs:Array[0..MaxWatchKeys-1] of DWord;
+  WatchHits:Int32=0;
+  LastWatchPoll:DWord=0;
+  WatchRearm:Boolean=False;
+
+function ReadGameTick:UInt32;
+Var V,BytesT:NativeUInt;
+begin
+  Result:=GameTick;
+  if ReadProcessMemory(PI.hProcess,Pointer($10A63F0),@V,SizeOf(V),BytesT) and (V>0)
+  and ReadProcessMemory(PI.hProcess,Pointer(V+$900),@V,SizeOf(V),BytesT) then
+    Result:=V;
+end;
+
+//Loads the watch addresses into DR0-DR3 of one thread, as 4 byte write breakpoints
+procedure SetDebugRegs(ThreadId:DWord);
+Var hThread:THandle;
+    C:TContext;
+    I:Int32;
+begin
+  hThread:=OpenThread(THREAD_GET_CONTEXT or THREAD_SET_CONTEXT or THREAD_SUSPEND_RESUME,False,ThreadId);
+  if hThread=0 then Exit;
+  SuspendThread(hThread);
+  C.ContextFlags:=CONTEXT_DEBUG_REGISTERS;
+  if GetThreadContext(hThread,C) then
+  begin
+    C.Dr0:=WatchAddrs[0];
+    C.Dr1:=WatchAddrs[1];
+    C.Dr2:=WatchAddrs[2];
+    C.Dr3:=WatchAddrs[3];
+    C.Dr7:=C.Dr7 and $FF00;
+    for I:=0 to MaxWatchKeys-1 do
+      if WatchAddrs[I]<>0 then //Local enable, break on write, 4 bytes
+        C.Dr7:=C.Dr7 or (DWord(1) shl (I*2)) or (DWord($D) shl (16+I*4));
+    SetThreadContext(hThread,C);
+  end;
+  ResumeThread(hThread);
+  CloseHandle(hThread);
+end;
+
+procedure SetAllDebugRegs;
+Var I:Int32;
+begin
+  for I:=Low(ThreadIds) to High(ThreadIds) do
+    SetDebugRegs(ThreadIds[I]);
+end;
+
+//Finds the watched keys in the node array of the watched table and arms their type tags
+procedure ArmWatch;
+Var T:TLuaTable;
+    N:TLuaNode;
+    BytesT:NativeUInt;
+    I,K,Cnt:Int32;
+    Str:String;
+begin
+  FillChar(WatchAddrs,SizeOf(WatchAddrs),0);
+  WatchNode:=0;
+  Str:='';
+  if ReadLuaTable(WatchTable,T) and IsLuaTableHeaderValid(T) then
+  begin
+    WatchNode:=T.Node;
+    Cnt:=1 shl T.LSizeNode;
+    if Cnt>MaxDumpNodes then Cnt:=MaxDumpNodes;
+    for I:=0 to Cnt-1 do
+      if ReadProcessMemory(PI.hProcess,Pointer(T.Node+DWord(I)*LuaNodeSize),@N,SizeOf(N),BytesT)
+      and (N.KeyTT=LuaStringTT) then
+        for K:=Low(WatchKeys) to High(WatchKeys) do
+          if (WatchAddrs[K]=0) and (ReadLuaStr(N.KeyV)=WatchKeys[K]) then
+          begin
+            WatchAddrs[K]:=T.Node+DWord(I)*LuaNodeSize;
+            Str:=Str+' "'+WatchKeys[K]+'" ['+IntToStr(I)+']';
+          end;
+  end;
+  if Str='' then Str:=' nothing';
+  SetAllDebugRegs;
+  DbgStrs:=DbgStrs+['Watch: table 0x'+UIntToHex(WatchTable)+', node 0x'+UIntToHex(WatchNode)
+    +', tick '+IntToStr(ReadGameTick)+', armed'+Str];
+end;
+
+//Arms a watch if the C++ exception is a Lua error carrying a watch request.
+//FA throws Lua errors as lua_RuntimeError, which keeps its lua_State at +$2C,
+//and the error message is on the top of that Lua stack.
+function HandleWatchRequest(ErrorPtr:NativeUInt):Boolean;
+Var BytesT,L,Top:NativeUInt;
+    Obj:Array[0..1] of DWord;
+    P:Int32;
+    Msg:UTF8String;
+    Args:TArray<UTF8String>;
+begin
+  Result:=False;
+  if not ReadProcessMemory(PI.hProcess,Pointer(ErrorPtr+$2C),@L,SizeOf(L),BytesT)
+  or (lStateType(L)<1)
+  or not ReadProcessMemory(PI.hProcess,Pointer(L+8),@Top,SizeOf(Top),BytesT)
+  or not ReadProcessMemory(PI.hProcess,Pointer(Top-8),@Obj,SizeOf(Obj),BytesT)
+  or (Obj[0]<>LuaStringTT) then Exit;
+  //FA's _TRACEBACK rewrites the message, so find the request in it and stop at the end of its line
+  Msg:=ReadLuaStr(Obj[1]);
+  P:=Pos(WatchMarker,Msg);
+  if P=0 then Exit;
+  Result:=True;
+  Msg:=Copy(Msg,P+Length(WatchMarker),MaxInt);
+  P:=Pos(#10,Msg);
+  if P>0 then Msg:=Copy(Msg,1,P-1);
+  Args:=nil;
+  while Msg<>'' do
+  begin
+    P:=Pos(' ',Msg);
+    if P=0 then P:=Length(Msg)+1;
+    if P>1 then Args:=Args+[Copy(Msg,1,P-1)];
+    Msg:=Copy(Msg,P+1,MaxInt);
+  end;
+  if Length(Args)<2 then Exit;
+  WatchTable:=HexToUInt(String(Args[0]));
+  WatchKeys:=Copy(Args,1,MaxWatchKeys);
+  ArmWatch;
+  //Resuming from the exception restores the debug registers of the raising thread, arm it again later
+  WatchRearm:=True;
+end;
+
+//Reports a hardware breakpoint hit on a watched key. False for other single steps.
+function HandleWatchHit(ThreadId:DWord):Boolean;
+Var hThread:THandle;
+    C:TContext;
+    T:TLuaTable;
+    V,BytesT:NativeUInt;
+    I:Int32;
+    Str:String;
+begin
+  Result:=False;
+  hThread:=OpenThread(THREAD_GET_CONTEXT or THREAD_SET_CONTEXT,False,ThreadId);
+  if hThread=0 then Exit;
+  C.ContextFlags:=CONTEXT_CONTROL or CONTEXT_INTEGER or CONTEXT_DEBUG_REGISTERS;
+  if GetThreadContext(hThread,C) and (C.Dr6 and $F<>0) then
+  begin
+    Result:=True;
+    for I:=0 to MaxWatchKeys-1 do
+      //Lua's own writes come from ltable.c, a moved node array is re-armed by PollWatch
+      if (C.Dr6 and (DWord(1) shl I)<>0) and (WatchAddrs[I]<>0) and (WatchHits<MaxWatchHits)
+      and ((C.Eip<LTableCodeStart) or (C.Eip>=LTableCodeEnd))
+      and ReadProcessMemory(PI.hProcess,Pointer(WatchAddrs[I]),@V,SizeOf(V),BytesT) and (V<>LuaStringTT)
+      and ReadLuaTable(WatchTable,T) and (T.Node=WatchNode) then
+      begin
+        Inc(WatchHits);
+        Str:='Write to 0x'+UIntToHex(WatchAddrs[I])+', the type tag of key "'+WatchKeys[I]+'", now 0x'+UIntToHex(V)
+          +#13+'Game tick: '+IntToStr(ReadGameTick)+', thread '+IntToStr(ThreadId)+', EIP is the instruction after the write'+#13
+          +'EAX: 0x'+UIntToHex(C.Eax)+', EBX: 0x'+UIntToHex(C.Ebx)+', '
+          +'ECX: 0x'+UIntToHex(C.Ecx)+', EDX: 0x'+UIntToHex(C.Edx)+#13
+          +'ESI: 0x'+UIntToHex(C.Esi)+', EDI: 0x'+UIntToHex(C.Edi)+', '
+          +'EBP: 0x'+UIntToHex(C.Ebp)+', ESP: 0x'+UIntToHex(C.Esp)+', EIP: 0x'+UIntToHex(C.Eip);
+        AddEventReport(WatchReports,'',Str+#13,
+          'Stacktrace:'+StacktraceToStr([PByte(C.Eip)]+StackWalk(PDWord(C.Esp),7))+#13#13
+          +'MiniDump:'+#13+GetMiniDumpStr(Pointer(C.Eip))+#13#13
+          +'Watched table:'+#13+GetLuaTableDumpStr(WatchTable,T));
+        FindStuff(WatchReports,C);
+        WatchAddrs[I]:=0; //Reported, stop watching this key
+      end;
+    C.Dr6:=0;
+    C.ContextFlags:=CONTEXT_DEBUG_REGISTERS;
+    SetThreadContext(hThread,C);
+    SetAllDebugRegs;
+  end;
+  CloseHandle(hThread);
+end;
+
+//Re-arms when the node array moved, and reports tags that changed without a reported write,
+//such as writes from the kernel, which debug registers don't catch
+procedure PollWatch;
+Var T:TLuaTable;
+    V,BytesT:NativeUInt;
+    I:Int32;
+begin
+  LastWatchPoll:=GetTickCount;
+  if WatchTable=0 then Exit;
+  if WatchRearm then
+  begin
+    WatchRearm:=False;
+    SetAllDebugRegs;
+  end;
+  if not ReadLuaTable(WatchTable,T) then
+  begin
+    DbgStrs:=DbgStrs+['Watch: table 0x'+UIntToHex(WatchTable)+' is gone, tick '+IntToStr(ReadGameTick)];
+    WatchTable:=0;
+    FillChar(WatchAddrs,SizeOf(WatchAddrs),0);
+    SetAllDebugRegs;
+    Exit;
+  end;
+  if T.Node<>WatchNode then
+  begin
+    ArmWatch;
+    Exit;
+  end;
+  for I:=0 to MaxWatchKeys-1 do
+    if (WatchAddrs[I]<>0) and ReadProcessMemory(PI.hProcess,Pointer(WatchAddrs[I]),@V,SizeOf(V),BytesT)
+    and (V<>LuaStringTT) then
+    begin
+      AddEventReport(WatchReports,'','Type tag of key "'+WatchKeys[I]+'" at 0x'+UIntToHex(WatchAddrs[I])
+        +' changed to 0x'+UIntToHex(V)+' without a reported write, found by polling at tick '+IntToStr(ReadGameTick)+#13,
+        'Watched table:'+#13+GetLuaTableDumpStr(WatchTable,T));
+      WatchAddrs[I]:=0;
+      SetAllDebugRegs;
+    end;
+end;
+
 procedure CPPExceptionHandling(SelfPtr:NativeUInt;const Context:TContext);
 Var ClassName:String;
     Data:Array[1..50] of NativeUInt;
@@ -1225,6 +1448,12 @@ begin
     WriteReports(CPPReports);
   end;
 
+  if WatchReports<>nil then
+  begin
+    WriteLog(#13+'Watch:'+#13);
+    WriteReports(WatchReports);
+  end;
+
   if DbgStrs<>nil then
   begin
     WriteLog(#13+'Debug messages:'+#13);
@@ -1232,7 +1461,7 @@ begin
       WriteLog(DbgStrs[I]+#13);
   end;
 
-  if (MonitorReports<>nil) or (AVReports<>nil) or (CPPReports<>nil) then
+  if (MonitorReports<>nil) or (AVReports<>nil) or (CPPReports<>nil) or (WatchReports<>nil) then
   begin
     WriteLog(#13+'DLLs:');
     for I:=Low(DLLs) to High(DLLs) do
@@ -1316,8 +1545,12 @@ begin
   end;
 
   SetConsoleCtrlHandler(@CloseConsole,True);
-  while DbgActive and WaitForDebugEvent(DbgEvent,INFINITE) do
+  while DbgActive do
   begin
+    if GetTickCount-LastWatchPoll>=WatchPollMs then
+      PollWatch;
+    if not WaitForDebugEvent(DbgEvent,WatchPollMs) then
+      if GetLastError=ERROR_SEM_TIMEOUT then Continue else Break;
     case DbgEvent.dwDebugEventCode of
       EXCEPTION_DEBUG_EVENT: begin
         with DbgEvent.Exception.ExceptionRecord do
@@ -1343,6 +1576,11 @@ begin
             end;
           end;
           EXCEPTION_SINGLE_STEP: begin
+            if HandleWatchHit(DbgEvent.dwThreadId) then
+            begin
+              ContinueDebugEvent(DbgEvent.dwProcessId,DbgEvent.dwThreadId,DBG_CONTINUE);
+              Continue;
+            end;
             for I:=Low(SoftBPs) to High(SoftBPs) do
               if not(BPSActive in SoftBPs[I].State) then
                 SoftBPs[I].Enable;
@@ -1355,8 +1593,7 @@ begin
             Context.ContextFlags:=CONTEXT_CONTROL or CONTEXT_INTEGER;
             GetThreadContext(hThread,Context);
 
-            if (ReadProcessMemory(PI.hProcess,Pointer($10A63F0),@V,SizeOf(V),BytesT)) and (V>0) then
-              if ReadProcessMemory(PI.hProcess,Pointer(V+$900),@V,SizeOf(V),BytesT) then GameTick:=V;
+            GameTick:=ReadGameTick;
             if ExceptionInformation[0]=0 then
               Str:='ACCESS_VIOLATION: Read from 0x'+UIntToHex(ExceptionInformation[1]) else
             if ExceptionInformation[0]=1 then
@@ -1388,7 +1625,8 @@ begin
             GetThreadContext(hThread,Context);
             CloseHandle(hThread);
 
-            CPPExceptionHandling(ExceptionInformation[1],Context);
+            if not HandleWatchRequest(ExceptionInformation[1]) then
+              CPPExceptionHandling(ExceptionInformation[1],Context);
           end;
         else
           hThread:=OpenThread(THREAD_GET_CONTEXT,False,DbgEvent.dwThreadId);
@@ -1403,6 +1641,7 @@ begin
         end;
       end;
       CREATE_PROCESS_DEBUG_EVENT: begin
+        ThreadIds:=ThreadIds+[DbgEvent.dwThreadId];
         ReadProcessMemory(PI.hProcess,Pointer($876666),@GameVer,SizeOf(GameVer),BytesT);
         if ProfilePtr>0 then
         begin
@@ -1418,7 +1657,15 @@ begin
         Str:=ReadDllName(DbgEvent.LoadDll);
         DLLs:=DLLs+[Str];
       end;
+      CREATE_THREAD_DEBUG_EVENT: begin
+        ThreadIds:=ThreadIds+[DbgEvent.dwThreadId];
+        if WatchTable<>0 then
+          SetDebugRegs(DbgEvent.dwThreadId);
+      end;
       EXIT_THREAD_DEBUG_EVENT: begin
+        for I:=High(ThreadIds) downto Low(ThreadIds) do
+          if ThreadIds[I]=DbgEvent.dwThreadId then
+            Delete(ThreadIds,I,1);
         if DbgEvent.ExitThread.dwExitCode<>0 then
           DbgStrs:=DbgStrs+['EXIT_THREAD: '+IntToStr(DbgEvent.ExitThread.dwExitCode)];
       end;

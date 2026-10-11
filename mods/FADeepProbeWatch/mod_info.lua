@@ -1,0 +1,16 @@
+name = "FADeepProbe cursor watch"
+uid = "2be67272-731c-4ced-b3f0-8d5e595e3d71"
+version = 1
+copyright = ""
+description = "Debugging aid for FADeepProbe. Tells FADeepProbe where the cursor's Lua table is, so it can catch whatever corrupts the hotspot keys. Does nothing when the game runs without FADeepProbe."
+author = "FAForever"
+url = "https://github.com/FAForever/FADeepProbe"
+selectable = true
+enabled = true
+exclusive = false
+ui_only = true
+requires = {}
+requiresNames = {}
+conflicts = {}
+before = {}
+after = {}
