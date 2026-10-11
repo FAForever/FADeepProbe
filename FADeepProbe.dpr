@@ -1,7 +1,7 @@
 program FADeepProbe;
 
-{$WEAKLINKRTTI ON}
-{$RTTI EXPLICIT METHODS([]) FIELDS([]) PROPERTIES([])}
+{$MODE DELPHIUNICODE}
+{$APPTYPE GUI}
 
 {$SetPEFlags $0001}
 {$SetPEFlags $0002}
@@ -10,7 +10,17 @@ program FADeepProbe;
 {$SetPEFlags $0010}
 {$SetPEFlags $0200}
 
-uses Winapi.Windows;
+uses Windows;
+
+type
+  PHMODULE=^HMODULE;
+  NTSTATUS=LongInt;
+  TOSVersionInfoExW=record
+    dwOSVersionInfoSize,dwMajorVersion,dwMinorVersion,dwBuildNumber,dwPlatformId:DWORD;
+    szCSDVersion:Array[0..127] of WideChar;
+    wServicePackMajor,wServicePackMinor,wSuiteMask:Word;
+    wProductType,wReserved:Byte;
+  end;
 
 type
   _MODULEINFO=record
@@ -43,7 +53,7 @@ type
 
 var
   CmdLine,WorkDir,Str:String;
-  SI:TStartupInfo;
+  SI:TStartupInfoW;
   PI:TProcessInformation;
   DbgEvent:TDebugEvent;
   SoftBPs:TBreakpoints;
@@ -73,17 +83,17 @@ function RtlGetVersion(var Info:TOSVersionInfoExW):NTSTATUS;stdcall;external 'nt
 function GetEnvVar(const Name:String):String;
 Var Size:UInt32;
 begin
-  Size:=GetEnvironmentVariable(PChar(Name),nil,0);
+  Size:=GetEnvironmentVariableW(PChar(Name),nil,0);
   SetLength(Result,Size-1);
-  GetEnvironmentVariable(PChar(Name),PChar(Result),Size);
+  GetEnvironmentVariableW(PChar(Name),PChar(Result),Size);
 end;
 
 function FileExists(const FileName:String):Boolean;
-Var Data:TWin32FindData;
+Var Data:TWin32FindDataW;
     hFile:THandle;
 begin
   Result:=False;
-  hFile:=FindFirstFile(PChar(FileName),Data);
+  hFile:=FindFirstFileW(PChar(FileName),Data);
   if hFile<>INVALID_HANDLE_VALUE then
   begin
     FindClose(hFile);
@@ -263,7 +273,7 @@ begin
   WriteProcessMemory(PI.hProcess,Ptr,@Data,1,BytesT);
   if BytesT<>1 then
   begin
-    MessageBox(0,'TBreakpoint.Enable->WriteProcessMemory','Error',MB_ICONERROR);
+    MessageBoxW(0,'TBreakpoint.Enable->WriteProcessMemory','Error',MB_ICONERROR);
     Halt;
   end;
   FlushInstructionCache(PI.hProcess,Ptr,1);
@@ -278,7 +288,7 @@ begin
   WriteProcessMemory(PI.hProcess,Ptr,@PrevByte,1,BytesT);
   if BytesT<>1 then
   begin
-    MessageBox(0,'TBreakpoint.Disable->WriteProcessMemory','Error',MB_ICONERROR);
+    MessageBoxW(0,'TBreakpoint.Disable->WriteProcessMemory','Error',MB_ICONERROR);
     Halt;
   end;
   FlushInstructionCache(PI.hProcess,Ptr,1);
@@ -297,7 +307,7 @@ begin
   ReadProcessMemory(PI.hProcess,Ptr,@Data,1,BytesT);
   if BytesT<>1 then
   begin
-    MessageBox(0,'AddSoftBP->ReadProcessMemory','Error',MB_ICONERROR);
+    MessageBoxW(0,'AddSoftBP->ReadProcessMemory','Error',MB_ICONERROR);
     Halt;
   end;
   SetLength(SoftBPs,Length(SoftBPs)+1);
@@ -392,8 +402,8 @@ begin
   while True do
   begin
     if not ReadProcessMemory(PI.hProcess,Pointer(Ptr),@Data,SizeOf(Data),BytesT) then Exit;
-    for I:=Low(Data) to High(Data) do
-      if Data[I]=#0 then Break;
+    I:=Low(Data);
+      while (I<=High(Data)) and (Data[I]<>#0) do Inc(I);
     Dec(I);
     Result:=Result+Copy(Data,Low(Data),I);
     if I<Length(Data) then Exit;
@@ -730,7 +740,7 @@ begin
   for I:=Low(Data) to (SizeOf(Data) div 2-1) do
     ByteToHex(Data[I]);
   Result:=Result+#13;
-  for I:=I to High(Data) do
+  for I:=SizeOf(Data) div 2 to High(Data) do
     ByteToHex(Data[I]);
 end;
 
@@ -746,8 +756,8 @@ procedure AddEventReport(var Reports:TArray<TEventReport>;const ClassName,Pt,Prm
 Var I,I2:Int32;
 begin
   I:=Low(Reports);
-  for I:=I to High(Reports) do
-    if Reports[I].ClassName=ClassName then
+  while I<=High(Reports) do
+    if Reports[I].ClassName<>ClassName then Inc(I) else
     with Reports[I] do
     begin
       for I2:=Low(EntryPts) to High(EntryPts) do
@@ -885,6 +895,9 @@ end;
 
 procedure WriteReport;
 Var I:Int32;
+    hNtDll:HMODULE;
+    WineGetVersion:TWineGetVersion;
+    VI:TOSVersionInfoExW;
 begin
   SetFilePointer(LogFile,0,nil,2);
   if GetFileSize(LogFile,nil)>0 then
@@ -893,13 +906,11 @@ begin
   WriteLog('Command line:'+#13);
   WriteLog(CmdLine+#13#13);
 
-  var hNtDll:=GetModuleHandle('ntdll.dll');
-  var WineGetVersion:TWineGetVersion;
+  hNtDll:=GetModuleHandleW('ntdll.dll');
   @WineGetVersion:=GetProcAddress(hNtDll,'wine_get_version');
   if Assigned(WineGetVersion) then
     WriteLog('Wine '+WineGetVersion()+#13);
 
-  var VI:TOSVersionInfoExW;
   FillChar(VI,SizeOf(VI),0);
   VI.dwOSVersionInfoSize:=SizeOf(VI);
   RtlGetVersion(VI);
@@ -970,7 +981,7 @@ begin
 end;
 
 begin
-  CmdLine:=GetCommandLine;
+  CmdLine:=GetCommandLineW;
   I:=Pos(ParamStr(1),CmdLine);
   if I<1 then CmdLine:='' else
     if CmdLine[I-1]='"' then
@@ -1002,20 +1013,20 @@ begin
     Str:='Report.txt' else
   if GetFilePath(Str)='' then
     Str:=WorkDir+Str;
-  LogFile:=CreateFile(PChar(Str),GENERIC_WRITE,FILE_SHARE_READ or FILE_SHARE_WRITE,nil,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,0);
+  LogFile:=CreateFileW(PChar(Str),GENERIC_WRITE,FILE_SHARE_READ or FILE_SHARE_WRITE,nil,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,0);
   if (LogFile=0) or (LogFile=$FFFFFFFF) then
   begin
-    MessageBox(0,PChar('CreateFile->'+#13+Str),'Error',MB_ICONERROR);
+    MessageBoxW(0,PChar('CreateFileW->'+#13+Str),'Error',MB_ICONERROR);
     Halt;
   end;
 
   FillChar(SI,SizeOf(SI),0);
   FillChar(PI,SizeOf(PI),0);
   SI.cb:=SizeOf(SI);
-  if not CreateProcess(nil,PChar(CmdLine),nil,nil,False,
+  if not CreateProcessW(nil,PChar(CmdLine),nil,nil,False,
     DEBUG_ONLY_THIS_PROCESS,nil,PChar(WorkDir),SI,PI) then
   begin
-    MessageBox(0,PChar('CreateProcess->'+#13+CmdLine),'Error',MB_ICONERROR);
+    MessageBoxW(0,PChar('CreateProcessW->'+#13+CmdLine),'Error',MB_ICONERROR);
     Halt;
   end;
 
@@ -1035,7 +1046,7 @@ begin
 
               Inc(EventsCnt);
               FindStuff(MonitorReports,Context);
-              SetConsoleTitle(PChar('Events: '+IntToStr(EventsCnt)+'  Classes: '
+              SetConsoleTitleW(PChar('Events: '+IntToStr(EventsCnt)+'  Classes: '
                 +IntToStr(Length(MonitorReports))));
 
               Context.EFlags:=Context.EFlags or $100; //Set EXCEPTION_SINGLE_STEP
@@ -1130,6 +1141,6 @@ begin
     ContinueDebugEvent(DbgEvent.dwProcessId,DbgEvent.dwThreadId,DBG_EXCEPTION_NOT_HANDLED);
   end;
   if DbgActive then
-    MessageBox(0,'WaitForDebugEvent','Error',MB_ICONERROR);
+    MessageBoxW(0,'WaitForDebugEvent','Error',MB_ICONERROR);
   WriteReport;
 end.
