@@ -18,17 +18,25 @@ FADeepProbe.exe [exe_path] [/p <hex_address>] [/<game_arg> ...]
 ### Watching memory
 Lua code can ask FADeepProbe to watch up to 4 dwords with hardware write breakpoints:
 ```lua
-pcall(error, "FADeepProbe watch " .. string.gsub(tostring(t), "^table: ", "") .. " key1 key2", 0)
-pcall(error, "FADeepProbe watchaddr 11502474 11505474", 0)
+pcall(error, "FADeepProbe watchaddr 11502474 11502000+474", 0)
 ```
 FA throws Lua errors as C++ exceptions, so FADeepProbe sees the request while the pcall swallows it.
-- `watch` watches the type tags of string keys of a table. Only Lua's table code writes them, so any other write is reported.
-- `watchaddr` watches raw addresses, in hex with an optional hex offset such as `1A2B3C40+1C`, since Lua numbers are floats and can't hold an address. An address counts as a key type tag of a table once Lua's table code writes it with that table in a register, and any other write while the table keeps that node array is reported. Other writes are counted per instruction.
+Addresses are hex strings. An optional hex offset, such as `11502000+474`, keeps the structure's address in the log.
+Each request replaces the previous one.
 
-Reports appear in the `Watch:` section of the report, with the writer's registers, stack, Lua calls and code, and the table.
-Key tags that change without a reported write, such as kernel writes, are reported when FADeepProbe polls them.
+The `Watch:` section of the report logs each address by game tick: when it was armed, the first write by each instruction, and the write counts:
+```
+0x11502000+0x474 0 armed
+0x11502000+0x474 120 first write by 0x0128E289, 0x00000004 -> 0x00000000, report 1
+0x11502000+0x474 0-3779 writes:
+    12 by ltable.c
+    4214 by 0x0128E289, last value 0x00000000
+```
+Each first write gets a numbered report below the log, with the writer's registers, stack, Lua calls and code.
+Lua's table code (`ltable.c`) is only counted, since Lua reuses memory often enough to use up the reports.
+Values that change without a caught write, such as kernel writes, are logged when FADeepProbe polls them.
 
-The `mods/FADeepProbeWatch` UI mod is an example of both requests, with functions to copy into your own hooks.
+The `mods/FADeepProbeWatch` UI mod is an example, with a function to copy into your own hooks.
 
 ### Building
 Requires [Free Pascal](https://www.freepascal.org/) 3.2.2 targeting i386-win32. All other compiler settings are in the source.

@@ -1,45 +1,36 @@
 -- FADeepProbe watch example
--- Shows how Lua asks FADeepProbe to watch memory with hardware write breakpoints, so the crash report names
--- whatever writes it. Copy the two functions below into a hook of your own and call them once the memory you
--- want to watch exists.
---
--- A request is a Lua error raised inside pcall: FA throws Lua errors as C++ exceptions, so FADeepProbe reads the
--- request from the exception while the pcall swallows the error. Without FADeepProbe the request does nothing.
--- FADeepProbe watches up to 4 dwords at a time, and each request replaces the previous one.
--- Reports appear in the `Watch:` section of FADeepProbe's report.
+-- Asks FADeepProbe to watch memory, so its report names whatever writes there.
+-- Copy the function below into your own hook and call it once the memory to watch exists.
+-- FADeepProbe watches up to 4 dwords, and each request replaces the previous one.
+-- Without FADeepProbe, the requests do nothing.
 
---- Asks FADeepProbe to watch the type tags of up to 4 string keys of a table. Only Lua's table code writes them,
---- so any other write is reported. The keys must already be in the table; FADeepProbe finds them again when the
---- table moves to a new node array.
----@param t table
----@param ... string # keys
-local function FADeepProbeWatchKeys(t, ...)
-    local address = string.gsub(tostring(t), "^table: ", "")
-    pcall(error, "FADeepProbe watch " .. address .. " " .. table.concat(arg, " "), 0)
-end
-
---- Asks FADeepProbe to watch up to 4 raw addresses, as hex strings with an optional hex offset such as
---- "1A2B3C40+B4", since Lua numbers are floats and can't hold an address. An address counts as a key type tag of
---- a table once Lua's table code writes it, and any other write while the table keeps that node array is
---- reported. Other writes are counted per instruction.
+--- Watches up to 4 addresses, given as hex strings with an optional hex offset, such as "1A2B3C40+B4".
+--- Give a structure's address as the base and the field as the offset: the log shows them that way, so it's
+--- clear which structure and field each line is about.
+--- The first write by each instruction gets a full report: registers, stack, Lua calls and code.
 ---@param ... string # addresses
 local function FADeepProbeWatchAddresses(...)
     pcall(error, "FADeepProbe watchaddr " .. table.concat(arg, " "), 0)
 end
 
--- Example: watch the cursor's hotspot keys, which a stray write zeroed in crashes of replays 27939676 and 27928517.
--- This hooks uimain.lua instead of cursor.lua because userInit.lua imports cursor.lua before UI mods are active.
--- SetupUI runs afterwards and creates the cursor, and it runs again with a new cursor every time the UI Lua
--- state starts.
+-- Example: watch the metatable (+C) and node array (+14) fields of the cursor's Lua table.
+-- SetupUI creates the cursor, and runs again with a new cursor each time the UI Lua state starts.
 do
     local oldSetupUI = SetupUI
     function SetupUI()
         oldSetupUI()
-        FADeepProbeWatchKeys(GetCursor(), "_hotspotX", "_hotspotY")
+        local cursor = string.gsub(tostring(GetCursor()), "^table: ", "")
+        FADeepProbeWatchAddresses(cursor .. "+C", cursor .. "+14")
 
-        -- Example: watch addresses from an earlier crash report, here node 9's key type tag (+B4) of the node
-        -- arrays that were hit. Addresses only repeat between runs with the same allocations, such as the same
-        -- replay. Uncomment to use; it replaces the key watch above.
+        -- Example: watch addresses found in a reproducible crash report. This replaces the watch above.
         -- FADeepProbeWatchAddresses("11502000+474", "11505474")
+        --
+        -- FADeepProbe's "Watch:" section logs each address by game tick, and gives each new writer a numbered report:
+        --     0x11502000+0x474 0 armed
+        --     0x11502000+0x474 120 first write by 0x0128E289, 0x00000004 -> 0x00000000, report 1
+        --     0x11502000+0x474 0-3779 writes:
+        --         12 by ltable.c
+        --         4214 by 0x0128E289, last value 0x00000000
+        -- A later request adds its own "armed" lines, and the old addresses keep their lines.
     end
 end
