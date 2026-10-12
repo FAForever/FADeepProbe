@@ -1744,11 +1744,8 @@ begin
             end;
           end;
           EXCEPTION_SINGLE_STEP: begin
-            if HandleWatchHit(DbgEvent.dwThreadId) then
-            begin
-              ContinueDebugEvent(DbgEvent.dwProcessId,DbgEvent.dwThreadId,DBG_CONTINUE);
-              Continue;
-            end;
+            //Stepping over a probe can also hit a watch, so handle both
+            HandleWatchHit(DbgEvent.dwThreadId);
             for I:=Low(SoftBPs) to High(SoftBPs) do
               if not(BPSActive in SoftBPs[I].State) then
                 SoftBPs[I].Enable;
