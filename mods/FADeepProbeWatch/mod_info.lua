@@ -1,8 +1,8 @@
-name = "FADeepProbe cursor watch"
+name = "FADeepProbe watch"
 uid = "2be67272-731c-4ced-b3f0-8d5e595e3d71"
-version = 1
+version = 2
 copyright = ""
-description = "Debugging aid for FADeepProbe. Tells FADeepProbe where the cursor's Lua table is, so it can catch whatever corrupts the hotspot keys. Does nothing when the game runs without FADeepProbe."
+description = "Debugging aid for FADeepProbe. Asks FADeepProbe to watch the memory where a stray write has been corrupting Lua tables, so the crash report names the writer. Does nothing when the game runs without FADeepProbe."
 author = "FAForever"
 url = "https://github.com/FAForever/FADeepProbe"
 selectable = true

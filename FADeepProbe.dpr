@@ -1120,28 +1120,49 @@ begin
     if GetLuaPt(Data[I]) then Break;
 end;
 
-//Watches the type tags of chosen string keys of one Lua table with hardware write breakpoints.
-//Lua requests a watch by raising an error inside pcall, which FA throws as a C++ exception:
-//  pcall(error,"FADeepProbe watch <table address> <key> <key>...",0)
-//A write from outside ltable.c means something other than Lua changed the key.
+//Watches up to 4 dwords with hardware write breakpoints. Lua requests a watch by raising an error
+//inside pcall, which FA throws as a C++ exception:
+//  pcall(error,"FADeepProbe watch <table address> <key> <key>...",0) watches the type tags of string keys
+//  pcall(error,"FADeepProbe watchaddr <address> <address>...",0)     watches raw addresses
+//Only Lua's table code (ltable.c) writes key type tags, so a key watch reports any other write.
+//A raw address belongs to whatever uses that memory at the time. It becomes a key tag when ltable.c
+//writes it with a table in a register whose node array holds it, and any other write while that table
+//still owns the node array is reported. Other writers are counted for the report.
 const
-  WatchMarker:UTF8String='FADeepProbe watch ';
+  WatchKeyMarker:UTF8String='FADeepProbe watch ';
+  WatchAddrMarker:UTF8String='FADeepProbe watchaddr ';
   WatchPollMs=250;
-  MaxWatchKeys=4; //Debug registers DR0-DR3
-  MaxWatchHits=8;
+  MaxWatchSlots=4; //Debug registers DR0-DR3
+  MaxWatchReports=8;
+  MaxWatchWriters=32;
   LuaStringTT=4;
   THREAD_SUSPEND_RESUME=$0002;
   CONTEXT_DEBUG_REGISTERS=$00010010;
   ERROR_SEM_TIMEOUT=121;
 
+type
+  TWatchSlot=record
+    Addr:DWord;
+    Armed:Boolean;    //False when unused or stopped
+    Key:UTF8String;   //Watched key, '' for a raw address
+    Table:NativeUInt; //Table whose node array holds Addr, 0 if none
+    Node:DWord;       //Node array of Table when it was learned
+    Value:DWord;      //Last value seen at Addr
+    Hits,LuaWrites:UInt32;
+  end;
+  TWatchWriter=record
+    Addr,Eip,Count,FirstTick,LastTick,Value:DWord;
+  end;
+
 var
   ThreadIds:TArray<DWord>;
   WatchReports:TArray<TEventReport>;
-  WatchTable:NativeUInt=0;
-  WatchNode:DWord=0;
+  Slots:Array[0..MaxWatchSlots-1] of TWatchSlot;
+  Writers:TArray<TWatchWriter>;
+  WatchTable:NativeUInt=0; //Table of the key watch, 0 for none
+  WatchNode:DWord=0;       //Its node array when armed
   WatchKeys:TArray<UTF8String>;
-  WatchAddrs:Array[0..MaxWatchKeys-1] of DWord;
-  WatchHits:Int32=0;
+  WatchReportCnt:Int32=0;
   LastWatchPoll:DWord=0;
   WatchRearm:Boolean=False;
 
@@ -1154,7 +1175,28 @@ begin
     Result:=V;
 end;
 
-//Loads the watch addresses into DR0-DR3 of one thread, as 4 byte write breakpoints
+procedure ClearSlots;
+Var I:Int32;
+begin
+  for I:=0 to MaxWatchSlots-1 do
+    Slots[I]:=Default(TWatchSlot);
+end;
+
+function ReadDWord(Addr:NativeUInt;out V:DWord):Boolean;
+Var BytesT:NativeUInt;
+begin
+  Result:=ReadProcessMemory(PI.hProcess,Pointer(Addr),@V,SizeOf(V),BytesT);
+end;
+
+function IsWatching:Boolean;
+Var I:Int32;
+begin
+  for I:=0 to MaxWatchSlots-1 do
+    if Slots[I].Armed then Exit(True);
+  Result:=False;
+end;
+
+//Loads the slot addresses into DR0-DR3 of one thread, as 4 byte write breakpoints
 procedure SetDebugRegs(ThreadId:DWord);
 Var hThread:THandle;
     C:TContext;
@@ -1166,13 +1208,13 @@ begin
   C.ContextFlags:=CONTEXT_DEBUG_REGISTERS;
   if GetThreadContext(hThread,C) then
   begin
-    C.Dr0:=WatchAddrs[0];
-    C.Dr1:=WatchAddrs[1];
-    C.Dr2:=WatchAddrs[2];
-    C.Dr3:=WatchAddrs[3];
+    C.Dr0:=Slots[0].Addr;
+    C.Dr1:=Slots[1].Addr;
+    C.Dr2:=Slots[2].Addr;
+    C.Dr3:=Slots[3].Addr;
     C.Dr7:=C.Dr7 and $FF00;
-    for I:=0 to MaxWatchKeys-1 do
-      if WatchAddrs[I]<>0 then //Local enable, break on write, 4 bytes
+    for I:=0 to MaxWatchSlots-1 do
+      if Slots[I].Armed then //Local enable, break on write, 4 bytes
         C.Dr7:=C.Dr7 or (DWord(1) shl (I*2)) or (DWord($D) shl (16+I*4));
     SetThreadContext(hThread,C);
   end;
@@ -1187,15 +1229,51 @@ begin
     SetDebugRegs(ThreadIds[I]);
 end;
 
-//Finds the watched keys in the node array of the watched table and arms their type tags
-procedure ArmWatch;
+//True while the table that owned the slot's address still has the same node array
+function IsSlotOwned(const S:TWatchSlot;out T:TLuaTable):Boolean;
+begin
+  Result:=(S.Table<>0) and ReadLuaTable(S.Table,T) and (T.Node=S.Node);
+end;
+
+//Finds a table in the registers whose node array has Addr as a key type tag
+function FindKeyOwner(const C:TContext;Addr:DWord;out Table:NativeUInt;out Node:DWord):Boolean;
+Var Ptrs:Array[0..6] of NativeUInt;
+    T:TLuaTable;
+    I:Int32;
+begin
+  Ptrs[0]:=C.Ebx;
+  Ptrs[1]:=C.Esi;
+  Ptrs[2]:=C.Edi;
+  Ptrs[3]:=C.Eax;
+  Ptrs[4]:=C.Ecx;
+  Ptrs[5]:=C.Edx;
+  Ptrs[6]:=C.Ebp;
+  for I:=Low(Ptrs) to High(Ptrs) do
+    if ReadLuaTable(Ptrs[I],T) and IsLuaTableHeaderValid(T) and (LuaNodeIndex(T,Addr)>=0) then
+    begin
+      Table:=Ptrs[I];
+      Node:=T.Node;
+      Exit(True);
+    end;
+  Result:=False;
+end;
+
+function SlotName(const S:TWatchSlot):String;
+begin
+  if S.Key<>'' then
+    Result:='the type tag of key "'+S.Key+'"' else
+    Result:='a key type tag of table 0x'+UIntToHex(S.Table);
+end;
+
+//Finds the watched keys in the node array of WatchTable and arms their type tags
+procedure ArmKeyWatch;
 Var T:TLuaTable;
     N:TLuaNode;
     BytesT:NativeUInt;
     I,K,Cnt:Int32;
     Str:String;
 begin
-  FillChar(WatchAddrs,SizeOf(WatchAddrs),0);
+  ClearSlots;
   WatchNode:=0;
   Str:='';
   if ReadLuaTable(WatchTable,T) and IsLuaTableHeaderValid(T) then
@@ -1207,9 +1285,14 @@ begin
       if ReadProcessMemory(PI.hProcess,Pointer(T.Node+DWord(I)*LuaNodeSize),@N,SizeOf(N),BytesT)
       and (N.KeyTT=LuaStringTT) then
         for K:=Low(WatchKeys) to High(WatchKeys) do
-          if (WatchAddrs[K]=0) and (ReadLuaStr(N.KeyV)=WatchKeys[K]) then
+          if not Slots[K].Armed and (ReadLuaStr(N.KeyV)=WatchKeys[K]) then
           begin
-            WatchAddrs[K]:=T.Node+DWord(I)*LuaNodeSize;
+            Slots[K].Addr:=T.Node+DWord(I)*LuaNodeSize;
+            Slots[K].Armed:=True;
+            Slots[K].Key:=WatchKeys[K];
+            Slots[K].Table:=WatchTable;
+            Slots[K].Node:=T.Node;
+            Slots[K].Value:=LuaStringTT;
             Str:=Str+' "'+WatchKeys[K]+'" ['+IntToStr(I)+']';
           end;
   end;
@@ -1217,6 +1300,25 @@ begin
   SetAllDebugRegs;
   DbgStrs:=DbgStrs+['Watch: table 0x'+UIntToHex(WatchTable)+', node 0x'+UIntToHex(WatchNode)
     +', tick '+IntToStr(ReadGameTick)+', armed'+Str];
+end;
+
+procedure ArmAddrWatch(const Addrs:TArray<UTF8String>);
+Var I:Int32;
+    Str:String;
+begin
+  ClearSlots;
+  WatchTable:=0;
+  Str:='';
+  for I:=0 to Length(Addrs)-1 do
+  begin
+    if I>=MaxWatchSlots then Break;
+    Slots[I].Addr:=HexToUInt(String(Addrs[I])) and not 3;
+    Slots[I].Armed:=True;
+    ReadDWord(Slots[I].Addr,Slots[I].Value);
+    Str:=Str+' 0x'+UIntToHex(Slots[I].Addr);
+  end;
+  SetAllDebugRegs;
+  DbgStrs:=DbgStrs+['Watch: tick '+IntToStr(ReadGameTick)+', armed addresses'+Str];
 end;
 
 //Arms a watch if the C++ exception is a Lua error carrying a watch request.
@@ -1227,6 +1329,7 @@ Var BytesT,L,Top:NativeUInt;
     Obj:Array[0..1] of DWord;
     P:Int32;
     Msg:UTF8String;
+    IsAddr:Boolean;
     Args:TArray<UTF8String>;
 begin
   Result:=False;
@@ -1237,10 +1340,16 @@ begin
   or (Obj[0]<>LuaStringTT) then Exit;
   //FA's _TRACEBACK rewrites the message, so find the request in it and stop at the end of its line
   Msg:=ReadLuaStr(Obj[1]);
-  P:=Pos(WatchMarker,Msg);
-  if P=0 then Exit;
+  P:=Pos(WatchAddrMarker,Msg);
+  IsAddr:=P>0;
+  if IsAddr then
+    Msg:=Copy(Msg,P+Length(WatchAddrMarker),MaxInt) else
+  begin
+    P:=Pos(WatchKeyMarker,Msg);
+    if P=0 then Exit;
+    Msg:=Copy(Msg,P+Length(WatchKeyMarker),MaxInt);
+  end;
   Result:=True;
-  Msg:=Copy(Msg,P+Length(WatchMarker),MaxInt);
   P:=Pos(#10,Msg);
   if P>0 then Msg:=Copy(Msg,1,P-1);
   Args:=nil;
@@ -1251,22 +1360,70 @@ begin
     if P>1 then Args:=Args+[Copy(Msg,1,P-1)];
     Msg:=Copy(Msg,P+1,MaxInt);
   end;
-  if Length(Args)<2 then Exit;
-  WatchTable:=HexToUInt(String(Args[0]));
-  WatchKeys:=Copy(Args,1,MaxWatchKeys);
-  ArmWatch;
+  if IsAddr then
+  begin
+    if Length(Args)>0 then
+      ArmAddrWatch(Args);
+  end else
+  if Length(Args)>=2 then
+  begin
+    WatchTable:=HexToUInt(String(Args[0]));
+    WatchKeys:=Copy(Args,1,MaxWatchSlots);
+    ArmKeyWatch;
+  end;
   //Resuming from the exception restores the debug registers of the raising thread, arm it again later
   WatchRearm:=True;
 end;
 
-//Reports a hardware breakpoint hit on a watched key. False for other single steps.
+procedure AddWriter(Addr,Eip,Value:DWord);
+Var I:Int32;
+    Tick:DWord;
+begin
+  Tick:=ReadGameTick;
+  for I:=Low(Writers) to High(Writers) do
+    if (Writers[I].Addr=Addr) and (Writers[I].Eip=Eip) then
+    begin
+      Inc(Writers[I].Count);
+      Writers[I].LastTick:=Tick;
+      Writers[I].Value:=Value;
+      Exit;
+    end;
+  if Length(Writers)>=MaxWatchWriters then Exit;
+  SetLength(Writers,Length(Writers)+1);
+  Writers[High(Writers)].Addr:=Addr;
+  Writers[High(Writers)].Eip:=Eip;
+  Writers[High(Writers)].Count:=1;
+  Writers[High(Writers)].FirstTick:=Tick;
+  Writers[High(Writers)].LastTick:=Tick;
+  Writers[High(Writers)].Value:=Value;
+end;
+
+//Reports a write to a slot's address from outside ltable.c while a table owns it
+procedure ReportWatchWrite(var S:TWatchSlot;const T:TLuaTable;const C:TContext;ThreadId,V:DWord);
+Var Str:String;
+begin
+  Inc(WatchReportCnt);
+  Str:='Write to 0x'+UIntToHex(S.Addr)+', '+SlotName(S)+', 0x'+UIntToHex(S.Value)+' -> 0x'+UIntToHex(V)
+    +#13+'Game tick: '+IntToStr(ReadGameTick)+', thread '+IntToStr(ThreadId)+', EIP is the instruction after the write'+#13
+    +'EAX: 0x'+UIntToHex(C.Eax)+', EBX: 0x'+UIntToHex(C.Ebx)+', '
+    +'ECX: 0x'+UIntToHex(C.Ecx)+', EDX: 0x'+UIntToHex(C.Edx)+#13
+    +'ESI: 0x'+UIntToHex(C.Esi)+', EDI: 0x'+UIntToHex(C.Edi)+', '
+    +'EBP: 0x'+UIntToHex(C.Ebp)+', ESP: 0x'+UIntToHex(C.Esp)+', EIP: 0x'+UIntToHex(C.Eip);
+  AddEventReport(WatchReports,'',Str+#13,
+    'Stacktrace:'+StacktraceToStr([PByte(C.Eip)]+StackWalk(PDWord(C.Esp),7))+#13#13
+    +'MiniDump:'+#13+GetMiniDumpStr(Pointer(C.Eip))+#13#13
+    +'Watched table:'+#13+GetLuaTableDumpStr(S.Table,T));
+  FindStuff(WatchReports,C);
+end;
+
+//Handles a hardware breakpoint hit on a slot. False for other single steps.
 function HandleWatchHit(ThreadId:DWord):Boolean;
 Var hThread:THandle;
     C:TContext;
     T:TLuaTable;
-    V,BytesT:NativeUInt;
+    V:DWord;
     I:Int32;
-    Str:String;
+    InLTable,Owned:Boolean;
 begin
   Result:=False;
   hThread:=OpenThread(THREAD_GET_CONTEXT or THREAD_SET_CONTEXT,False,ThreadId);
@@ -1275,26 +1432,33 @@ begin
   if GetThreadContext(hThread,C) and (C.Dr6 and $F<>0) then
   begin
     Result:=True;
-    for I:=0 to MaxWatchKeys-1 do
-      //Lua's own writes come from ltable.c, a moved node array is re-armed by PollWatch
-      if (C.Dr6 and (DWord(1) shl I)<>0) and (WatchAddrs[I]<>0) and (WatchHits<MaxWatchHits)
-      and ((C.Eip<LTableCodeStart) or (C.Eip>=LTableCodeEnd))
-      and ReadProcessMemory(PI.hProcess,Pointer(WatchAddrs[I]),@V,SizeOf(V),BytesT) and (V<>LuaStringTT)
-      and ReadLuaTable(WatchTable,T) and (T.Node=WatchNode) then
+    InLTable:=(C.Eip>=LTableCodeStart) and (C.Eip<LTableCodeEnd);
+    for I:=0 to MaxWatchSlots-1 do
+    with Slots[I] do
+      if (C.Dr6 and (DWord(1) shl I)<>0) and Armed and ReadDWord(Addr,V) then
       begin
-        Inc(WatchHits);
-        Str:='Write to 0x'+UIntToHex(WatchAddrs[I])+', the type tag of key "'+WatchKeys[I]+'", now 0x'+UIntToHex(V)
-          +#13+'Game tick: '+IntToStr(ReadGameTick)+', thread '+IntToStr(ThreadId)+', EIP is the instruction after the write'+#13
-          +'EAX: 0x'+UIntToHex(C.Eax)+', EBX: 0x'+UIntToHex(C.Ebx)+', '
-          +'ECX: 0x'+UIntToHex(C.Ecx)+', EDX: 0x'+UIntToHex(C.Edx)+#13
-          +'ESI: 0x'+UIntToHex(C.Esi)+', EDI: 0x'+UIntToHex(C.Edi)+', '
-          +'EBP: 0x'+UIntToHex(C.Ebp)+', ESP: 0x'+UIntToHex(C.Esp)+', EIP: 0x'+UIntToHex(C.Eip);
-        AddEventReport(WatchReports,'',Str+#13,
-          'Stacktrace:'+StacktraceToStr([PByte(C.Eip)]+StackWalk(PDWord(C.Esp),7))+#13#13
-          +'MiniDump:'+#13+GetMiniDumpStr(Pointer(C.Eip))+#13#13
-          +'Watched table:'+#13+GetLuaTableDumpStr(WatchTable,T));
-        FindStuff(WatchReports,C);
-        WatchAddrs[I]:=0; //Reported, stop watching this key
+        Inc(Hits);
+        if InLTable then
+        begin
+          Inc(LuaWrites);
+          if (Key='') and not FindKeyOwner(C,Addr,Table,Node) then
+            Table:=0;
+        end else
+        begin
+          Owned:=IsSlotOwned(Slots[I],T);
+          if Owned and (V<>Value) and (WatchReportCnt<MaxWatchReports) then
+            ReportWatchWrite(Slots[I],T,C,ThreadId,V);
+          if Key<>'' then
+          begin
+            if Owned and (V<>Value) then Armed:=False; //Reported, stop watching this key
+          end else
+          begin
+            if not Owned or (V<>Value) then
+              Table:=0; //No longer a key tag
+            AddWriter(Addr,C.Eip,V);
+          end;
+        end;
+        Value:=V;
       end;
     C.Dr6:=0;
     C.ContextFlags:=CONTEXT_DEBUG_REGISTERS;
@@ -1304,43 +1468,70 @@ begin
   CloseHandle(hThread);
 end;
 
-//Re-arms when the node array moved, and reports tags that changed without a reported write,
-//such as writes from the kernel, which debug registers don't catch
+//Re-arms a key watch whose node array moved, drops owners that freed their node array, and reports
+//key tags that changed without a reported write, such as writes from the kernel, which debug registers
+//don't catch
 procedure PollWatch;
 Var T:TLuaTable;
-    V,BytesT:NativeUInt;
+    V:DWord;
     I:Int32;
 begin
   LastWatchPoll:=GetTickCount;
-  if WatchTable=0 then Exit;
   if WatchRearm then
   begin
     WatchRearm:=False;
     SetAllDebugRegs;
   end;
-  if not ReadLuaTable(WatchTable,T) then
-  begin
-    DbgStrs:=DbgStrs+['Watch: table 0x'+UIntToHex(WatchTable)+' is gone, tick '+IntToStr(ReadGameTick)];
-    WatchTable:=0;
-    FillChar(WatchAddrs,SizeOf(WatchAddrs),0);
-    SetAllDebugRegs;
-    Exit;
-  end;
-  if T.Node<>WatchNode then
-  begin
-    ArmWatch;
-    Exit;
-  end;
-  for I:=0 to MaxWatchKeys-1 do
-    if (WatchAddrs[I]<>0) and ReadProcessMemory(PI.hProcess,Pointer(WatchAddrs[I]),@V,SizeOf(V),BytesT)
-    and (V<>LuaStringTT) then
+  if WatchTable<>0 then
+    if not ReadLuaTable(WatchTable,T) then
     begin
-      AddEventReport(WatchReports,'','Type tag of key "'+WatchKeys[I]+'" at 0x'+UIntToHex(WatchAddrs[I])
-        +' changed to 0x'+UIntToHex(V)+' without a reported write, found by polling at tick '+IntToStr(ReadGameTick)+#13,
-        'Watched table:'+#13+GetLuaTableDumpStr(WatchTable,T));
-      WatchAddrs[I]:=0;
+      DbgStrs:=DbgStrs+['Watch: table 0x'+UIntToHex(WatchTable)+' is gone, tick '+IntToStr(ReadGameTick)];
+      WatchTable:=0;
+      ClearSlots;
       SetAllDebugRegs;
+      Exit;
+    end else
+    if T.Node<>WatchNode then
+    begin
+      ArmKeyWatch;
+      Exit;
     end;
+  for I:=0 to MaxWatchSlots-1 do
+  with Slots[I] do
+    if Armed and (Table<>0) and ReadDWord(Addr,V) and (V<>Value) then
+    begin
+      if IsSlotOwned(Slots[I],T) and (WatchReportCnt<MaxWatchReports) then
+      begin
+        Inc(WatchReportCnt);
+        AddEventReport(WatchReports,'','Value at 0x'+UIntToHex(Addr)+', '+SlotName(Slots[I])
+          +', changed 0x'+UIntToHex(Value)+' -> 0x'+UIntToHex(V)+' without a reported write, found by polling at tick '
+          +IntToStr(ReadGameTick)+#13,'Watched table:'+#13+GetLuaTableDumpStr(Table,T));
+      end;
+      if Key<>'' then
+      begin
+        Armed:=False;
+        SetAllDebugRegs;
+      end else
+        Table:=0;
+      Value:=V;
+    end;
+end;
+
+//Hit counts and the writers outside ltable.c, for the report
+function GetWatchSummaryStr:String;
+Var I:Int32;
+begin
+  Result:='';
+  for I:=0 to MaxWatchSlots-1 do
+    if Slots[I].Hits>0 then
+      Result:=Result+'0x'+UIntToHex(Slots[I].Addr)+': '+IntToStr(Slots[I].Hits)+' writes, '
+        +IntToStr(Slots[I].LuaWrites)+' from ltable.c'+#13;
+  for I:=Low(Writers) to High(Writers) do
+  with Writers[I] do
+    Result:=Result+'0x'+UIntToHex(Addr)+' written by'+StacktraceToStr([PByte(Eip)])+' x'+IntToStr(Count)
+      +', ticks '+IntToStr(FirstTick)+'-'+IntToStr(LastTick)+', last value 0x'+UIntToHex(Value)+#13;
+  if Length(Writers)>=MaxWatchWriters then
+    Result:=Result+'Only the first '+IntToStr(MaxWatchWriters)+' writers are listed'+#13;
 end;
 
 procedure CPPExceptionHandling(SelfPtr:NativeUInt;const Context:TContext);
@@ -1448,9 +1639,11 @@ begin
     WriteReports(CPPReports);
   end;
 
-  if WatchReports<>nil then
+  Str:=GetWatchSummaryStr;
+  if (WatchReports<>nil) or (Str<>'') then
   begin
     WriteLog(#13+'Watch:'+#13);
+    WriteLog(Str);
     WriteReports(WatchReports);
   end;
 
@@ -1659,7 +1852,7 @@ begin
       end;
       CREATE_THREAD_DEBUG_EVENT: begin
         ThreadIds:=ThreadIds+[DbgEvent.dwThreadId];
-        if WatchTable<>0 then
+        if IsWatching then
           SetDebugRegs(DbgEvent.dwThreadId);
       end;
       EXIT_THREAD_DEBUG_EVENT: begin
