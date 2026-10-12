@@ -1123,7 +1123,7 @@ end;
 //Watches up to 4 dwords with hardware write breakpoints. Lua requests a watch by raising an error
 //inside pcall, which FA throws as a C++ exception:
 //  pcall(error,"FADeepProbe watch <table address> <key> <key>...",0) watches the type tags of string keys
-//  pcall(error,"FADeepProbe watchaddr <address> <address>...",0)     watches raw addresses
+//  pcall(error,"FADeepProbe watchaddr <address>[+<offset>]...",0)   watches raw addresses
 //Only Lua's table code (ltable.c) writes key type tags, so a key watch reports any other write.
 //A raw address belongs to whatever uses that memory at the time. It becomes a key tag when ltable.c
 //writes it with a table in a register whose node array holds it, and any other write while that table
@@ -1302,9 +1302,11 @@ begin
     +', tick '+IntToStr(ReadGameTick)+', armed'+Str];
 end;
 
+//Addresses are hex, optionally with a hex offset, such as 1A2B3C40+1C:
+//Lua numbers are floats and can't hold an address
 procedure ArmAddrWatch(const Addrs:TArray<UTF8String>);
-Var I:Int32;
-    Str:String;
+Var I,P:Int32;
+    Str,A:String;
 begin
   ClearSlots;
   WatchTable:=0;
@@ -1312,7 +1314,11 @@ begin
   for I:=0 to Length(Addrs)-1 do
   begin
     if I>=MaxWatchSlots then Break;
-    Slots[I].Addr:=HexToUInt(String(Addrs[I])) and not 3;
+    A:=String(Addrs[I]);
+    P:=Pos('+',A);
+    if P>0 then
+      Slots[I].Addr:=(HexToUInt(Copy(A,1,P-1))+HexToUInt(Copy(A,P+1,MaxInt))) and not 3 else
+      Slots[I].Addr:=HexToUInt(A) and not 3;
     Slots[I].Armed:=True;
     ReadDWord(Slots[I].Addr,Slots[I].Value);
     Str:=Str+' 0x'+UIntToHex(Slots[I].Addr);

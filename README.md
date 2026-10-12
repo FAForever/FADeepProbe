@@ -23,7 +23,7 @@ pcall(error, "FADeepProbe watchaddr 11502474 11505474", 0)
 ```
 FA throws Lua errors as C++ exceptions, so FADeepProbe sees the request while the pcall swallows it.
 - `watch` watches the type tags of string keys of a table. Only Lua's table code writes them, so any other write is reported.
-- `watchaddr` watches raw addresses. An address counts as a key type tag of a table once Lua's table code writes it with that table in a register, and any other write while the table keeps that node array is reported. Other writes are counted per instruction.
+- `watchaddr` watches raw addresses, in hex with an optional hex offset such as `1A2B3C40+1C`, since Lua numbers are floats and can't hold an address. An address counts as a key type tag of a table once Lua's table code writes it with that table in a register, and any other write while the table keeps that node array is reported. Other writes are counted per instruction.
 
 Reports appear in the `Watch:` section of the report, with the writer's registers, stack, Lua calls and code, and the table.
 Key tags that change without a reported write, such as kernel writes, are reported when FADeepProbe polls them.
