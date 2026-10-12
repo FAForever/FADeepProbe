@@ -63,11 +63,10 @@ var
   LogFile:THandle;
   I:Int32;
   DbgActive:Boolean=True;
-  ProfilePtr:UInt32=0;
-  EventsCnt:UInt32=0;
+  StartProbes,StartWatches:TArray<String>;
   GameTick:UInt32=0;
   DLLs,DbgStrs:TArray<String>;
-  MonitorReports,AVReports,CPPReports:TArray<TEventReport>;
+  AVReports,CPPReports:TArray<TEventReport>;
   GameVer,BytesT:NativeUInt;
 
 const
@@ -1120,13 +1119,15 @@ begin
     if GetLuaPt(Data[I]) then Break;
 end;
 
-//Watches up to 4 dwords with hardware write breakpoints. Lua requests a watch by raising an error
-//inside pcall, which FA throws as a C++ exception:
+//Watches up to 4 dwords with hardware write breakpoints, from /w or from Lua. Each watch request, and each
+//probe that arms its expressions, replaces all 4. Lua requests a watch by raising an error inside pcall,
+//which FA throws as a C++ exception:
 //  pcall(error,"FADeepProbe watchaddr <address>[+<offset>]...",0)
 //Writes are counted per instruction, and the first write by each instruction gets a full report.
 //Lua's table code (ltable.c) is only counted: Lua reuses memory so often that it would use up the reports.
 const
   WatchAddrMarker:UTF8String='FADeepProbe watchaddr ';
+  ProbeMarker:UTF8String='FADeepProbe probe ';
   WatchPollMs=250;
   MaxWatchSlots=4; //Debug registers DR0-DR3
   MaxWatchReports=8;
@@ -1215,13 +1216,19 @@ begin
     AddWatchEvent(S.Name,First,Last,'writes:'+Str);
 end;
 
+//Disarms all watched addresses
 procedure ClearSlots;
 Var I:Int32;
+    Tick:DWord;
 begin
+  Tick:=ReadGameTick;
   for I:=0 to MaxWatchSlots-1 do
   begin
     if Slots[I].Armed then
+    begin
       FlushSlot(Slots[I]);
+      AddWatchEvent(Slots[I].Name,Tick,Tick,'disarmed by a new watch');
+    end;
     Slots[I]:=Default(TWatchSlot);
   end;
 end;
@@ -1273,55 +1280,258 @@ begin
     SetDebugRegs(ThreadIds[I]);
 end;
 
-//Addresses are hex, optionally with a hex offset, such as 1A2B3C40+1C:
+type
+  //An address to watch. With HasOfs, the log shows it as base+offset.
+  TWatchSpec=record
+    Base,Ofs:DWord;
+    HasOfs:Boolean;
+    Source:String; //Appended to the armed line
+  end;
+
+//Splits a request or command line value at spaces
+function SplitArgs(Str:String):TArray<String>;
+Var P:Int32;
+begin
+  Result:=nil;
+  while Str<>'' do
+  begin
+    P:=Pos(' ',Str);
+    if P=0 then P:=Length(Str)+1;
+    if P>1 then Result:=Result+[Copy(Str,1,P-1)];
+    Str:=Copy(Str,P+1,MaxInt);
+  end;
+end;
+
+//Parses a hex address, optionally with a hex offset, such as 1A2B3C40+1C:
 //Lua numbers are floats and can't hold an address
-procedure ArmAddrWatch(const Addrs:TArray<UTF8String>);
-Var I,P:Int32;
-    A:String;
-    Tick,Base,Ofs:DWord;
+function ParseAddrSpec(const A:String):TWatchSpec;
+Var P:Int32;
+begin
+  Result:=Default(TWatchSpec);
+  P:=Pos('+',A);
+  Result.HasOfs:=P>0;
+  if Result.HasOfs then
+  begin
+    Result.Base:=HexToUInt(Copy(A,1,P-1));
+    Result.Ofs:=HexToUInt(Copy(A,P+1,MaxInt));
+  end else
+    Result.Base:=HexToUInt(A);
+end;
+
+//Replaces all watched addresses, even when Specs has fewer than 4. Specs past the 4th aren't armed.
+procedure ArmWatch(const Specs:TArray<TWatchSpec>);
+Var I:Int32;
+    Tick:DWord;
+    Expr:String;
 begin
   ClearSlots;
   Tick:=ReadGameTick;
-  for I:=0 to Length(Addrs)-1 do
+  for I:=0 to Length(Specs)-1 do
   begin
-    if I>=MaxWatchSlots then Break;
-    A:=String(Addrs[I]);
-    P:=Pos('+',A);
-    if P>0 then
+    with Specs[I] do
     begin
-      Base:=HexToUInt(Copy(A,1,P-1));
-      Ofs:=HexToUInt(Copy(A,P+1,MaxInt));
-    end else
-    begin
-      Base:=HexToUInt(A);
-      Ofs:=0;
+      if HasOfs then
+        Expr:='0x'+UIntToHex(Base)+'+0x'+UIntToHex(Ofs,True) else
+        Expr:='0x'+UIntToHex(Base);
+      if I>=MaxWatchSlots then
+      begin
+        AddWatchEvent(Expr,Tick,Tick,'not armed, only '+IntToStr(MaxWatchSlots)+' addresses can be watched'+Source);
+        Continue;
+      end;
+      Slots[I].Addr:=(Base+Ofs) and not 3;
+      //The log keeps the base address, so writes to one structure share it
+      if Slots[I].Addr=Base+Ofs then
+        Slots[I].Name:=Expr else
+        Slots[I].Name:='0x'+UIntToHex(Slots[I].Addr);
+      Slots[I].Armed:=True;
+      ReadDWord(Slots[I].Addr,Slots[I].Value);
+      if Slots[I].Addr=Base+Ofs then
+        AddWatchEvent(Slots[I].Name,Tick,Tick,'armed'+Source) else
+        AddWatchEvent(Slots[I].Name,Tick,Tick,'armed ('+Expr+' rounded down to '+Slots[I].Name+')'+Source);
     end;
-    Slots[I].Addr:=(Base+Ofs) and not 3;
-    //The log keeps the base address, so writes to one structure share it
-    if (P>0) and (Slots[I].Addr=Base+Ofs) then
-      Slots[I].Name:='0x'+UIntToHex(Base)+'+0x'+UIntToHex(Ofs,True) else
-      Slots[I].Name:='0x'+UIntToHex(Slots[I].Addr);
-    Slots[I].Armed:=True;
-    ReadDWord(Slots[I].Addr,Slots[I].Value);
-    if Slots[I].Addr=Base+Ofs then
-      AddWatchEvent(Slots[I].Name,Tick,Tick,'armed') else
-    if P>0 then
-      AddWatchEvent(Slots[I].Name,Tick,Tick,'armed (0x'+UIntToHex(Base)+'+0x'+UIntToHex(Ofs,True)+' rounded down to '
-        +Slots[I].Name+')') else
-      AddWatchEvent(Slots[I].Name,Tick,Tick,'armed (0x'+UIntToHex(Base)+' rounded down to '+Slots[I].Name+')');
   end;
   SetAllDebugRegs;
+  //Resuming from a C++ exception restores the debug registers of the raising thread, and the loader
+  //resets them in a new process, so arm them again at the next poll
+  WatchRearm:=True;
 end;
 
-//Arms a watch if the C++ exception is a Lua error carrying a watch request.
+procedure ArmAddrWatch(const Addrs:TArray<String>);
+Var Specs:TArray<TWatchSpec>;
+    I:Int32;
+begin
+  SetLength(Specs,Length(Addrs));
+  for I:=0 to High(Addrs) do
+    Specs[I]:=ParseAddrSpec(Addrs[I]);
+  ArmWatch(Specs);
+end;
+
+//Probes put a software breakpoint on an instruction, from /p or from Lua:
+//  pcall(error,"FADeepProbe probe <address>[:<expression>...]...",0)
+//Each hit is counted, and the C++ classes and Lua calls that reach it are collected.
+//The expressions are watched on the next hit, as <register>[+<offset>] or [<register>[+<offset>]][+<offset>]
+//in hex, such as ecx+474 for a field of the object a method is called on.
+type
+  TProbe=record
+    Addr:DWord;
+    Name:String;
+    Exprs:TArray<String>; //Watched on the next hit
+    Hits,FirstTick,LastTick:DWord;
+    Reports:TArray<TEventReport>;
+  end;
+
+var
+  Probes:TArray<TProbe>;
+  ProbeHits:UInt32=0;
+
+function FindProbe(Addr:DWord):Int32;
+Var I:Int32;
+begin
+  for I:=Low(Probes) to High(Probes) do
+    if Probes[I].Addr=Addr then Exit(I);
+  Result:=-1;
+end;
+
+//Adds a probe from <address>[:<expression>...]. Probing an address again replaces its expressions.
+procedure AddProbe(const Spec:String);
+Var P,I:Int32;
+    Str,Name,Note:String;
+    Addr,Tick:DWord;
+    B:Byte;
+    BytesT:NativeUInt;
+    Exprs:TArray<String>;
+begin
+  P:=Pos(':',Spec);
+  if P=0 then P:=Length(Spec)+1;
+  Addr:=HexToUInt(Copy(Spec,1,P-1));
+  Str:=Copy(Spec,P+1,MaxInt);
+  Exprs:=nil;
+  Note:='';
+  while Str<>'' do
+  begin
+    P:=Pos(':',Str);
+    if P=0 then P:=Length(Str)+1;
+    if P>1 then
+    begin
+      Exprs:=Exprs+[Copy(Str,1,P-1)];
+      Note:=Note+' '+Copy(Str,1,P-1);
+    end;
+    Str:=Copy(Str,P+1,MaxInt);
+  end;
+  Tick:=ReadGameTick;
+  Name:='0x'+UIntToHex(Addr);
+  if not ReadProcessMemory(PI.hProcess,Pointer(Addr),@B,1,BytesT) then
+  begin
+    AddWatchEvent(Name,Tick,Tick,'can''t probe an unreadable address');
+    Exit;
+  end;
+  I:=FindProbe(Addr);
+  if I<0 then
+  begin
+    SetLength(Probes,Length(Probes)+1);
+    I:=High(Probes);
+    Probes[I].Addr:=Addr;
+    Probes[I].Name:=Name;
+    AddSoftBP(Pointer(Addr),0,[BPSActive]);
+  end;
+  Probes[I].Exprs:=Exprs;
+  if Note<>'' then
+    Note:=', watches'+Note+' on the next hit';
+  AddWatchEvent(Name,Tick,Tick,'probe armed'+Note);
+end;
+
+function ReadReg(const Name:String;const C:TContext;out V:DWord):Boolean;
+Var Str:String;
+    I:Int32;
+begin
+  Str:=Name;
+  for I:=Low(Str) to High(Str) do
+    if (Str[I]>='A') and (Str[I]<='Z') then
+      Str[I]:=Char(Ord(Str[I])+32);
+  Result:=True;
+  if Str='eax' then V:=C.Eax else
+  if Str='ebx' then V:=C.Ebx else
+  if Str='ecx' then V:=C.Ecx else
+  if Str='edx' then V:=C.Edx else
+  if Str='esi' then V:=C.Esi else
+  if Str='edi' then V:=C.Edi else
+  if Str='ebp' then V:=C.Ebp else
+  if Str='esp' then V:=C.Esp else
+    Result:=False;
+end;
+
+//Evaluates <register>[+<offset>]
+function EvalRegTerm(const Str:String;const C:TContext;out V,Ofs:DWord):Boolean;
+Var P:Int32;
+begin
+  P:=Pos('+',Str);
+  if P=0 then P:=Length(Str)+1;
+  Ofs:=HexToUInt(Copy(Str,P+1,MaxInt));
+  Result:=ReadReg(Copy(Str,1,P-1),C,V);
+end;
+
+//Evaluates <register>[+<offset>] or [<register>[+<offset>]][+<offset>] to a base and an offset
+function EvalProbeExpr(const Expr:String;const C:TContext;out S:TWatchSpec):Boolean;
+Var P:Int32;
+    V,Ofs:DWord;
+begin
+  S:=Default(TWatchSpec);
+  if (Expr<>'') and (Expr[1]='[') then
+  begin
+    P:=Pos(']',Expr);
+    Result:=(P>0) and EvalRegTerm(Copy(Expr,2,P-2),C,V,Ofs) and ReadDWord(V+Ofs,S.Base);
+    S.HasOfs:=P<Length(Expr);
+    S.Ofs:=HexToUInt(Copy(Expr,P+1,MaxInt));
+  end else
+  begin
+    Result:=EvalRegTerm(Expr,C,S.Base,S.Ofs);
+    S.HasOfs:=Pos('+',Expr)>0;
+  end;
+end;
+
+//Counts a probe hit, collects its callers and arms its expressions. False if Addr isn't a probe.
+function HandleProbeHit(Addr:DWord;const C:TContext):Boolean;
+Var I,K:Int32;
+    Tick:DWord;
+    Spec:TWatchSpec;
+    Specs:TArray<TWatchSpec>;
+begin
+  I:=FindProbe(Addr);
+  Result:=I>=0;
+  if not Result then Exit;
+  Inc(ProbeHits);
+  Tick:=ReadGameTick;
+  with Probes[I] do
+  begin
+    if Hits=0 then FirstTick:=Tick;
+    LastTick:=Tick;
+    Inc(Hits);
+    FindStuff(Reports,C);
+    if Exprs=nil then Exit;
+    Specs:=nil;
+    for K:=Low(Exprs) to High(Exprs) do
+      if EvalProbeExpr(Exprs[K],C,Spec) then
+      begin
+        Spec.Source:=' by probe '+Name+' ('+Exprs[K]+')';
+        Specs:=Specs+[Spec];
+      end else
+        AddWatchEvent(Name,Tick,Tick,'can''t evaluate '+Exprs[K]);
+    Exprs:=nil;
+  end;
+  if Specs<>nil then
+    ArmWatch(Specs);
+end;
+
+//Handles a C++ exception that is a Lua error carrying a watch or probe request.
 //FA throws Lua errors as lua_RuntimeError, which keeps its lua_State at +$2C,
 //and the error message is on the top of that Lua stack.
 function HandleWatchRequest(ErrorPtr:NativeUInt):Boolean;
 Var BytesT,L,Top:NativeUInt;
     Obj:Array[0..1] of DWord;
-    P:Int32;
+    P,I:Int32;
     Msg:UTF8String;
-    Args:TArray<UTF8String>;
+    IsProbe:Boolean;
+    Args:TArray<String>;
 begin
   Result:=False;
   if not ReadProcessMemory(PI.hProcess,Pointer(ErrorPtr+$2C),@L,SizeOf(L),BytesT)
@@ -1332,23 +1542,23 @@ begin
   //FA's _TRACEBACK rewrites the message, so find the request in it and stop at the end of its line
   Msg:=ReadLuaStr(Obj[1]);
   P:=Pos(WatchAddrMarker,Msg);
-  if P=0 then Exit;
+  IsProbe:=P=0;
+  if not IsProbe then
+    Msg:=Copy(Msg,P+Length(WatchAddrMarker),MaxInt) else
+  begin
+    P:=Pos(ProbeMarker,Msg);
+    if P=0 then Exit;
+    Msg:=Copy(Msg,P+Length(ProbeMarker),MaxInt);
+  end;
   Result:=True;
-  Msg:=Copy(Msg,P+Length(WatchAddrMarker),MaxInt);
   P:=Pos(#10,Msg);
   if P>0 then Msg:=Copy(Msg,1,P-1);
-  Args:=nil;
-  while Msg<>'' do
-  begin
-    P:=Pos(' ',Msg);
-    if P=0 then P:=Length(Msg)+1;
-    if P>1 then Args:=Args+[Copy(Msg,1,P-1)];
-    Msg:=Copy(Msg,P+1,MaxInt);
-  end;
-  if Length(Args)>0 then
+  Args:=SplitArgs(String(Msg));
+  if IsProbe then
+    for I:=Low(Args) to High(Args) do
+      AddProbe(Args[I]) else
+  if Args<>nil then
     ArmAddrWatch(Args);
-  //Resuming from the exception restores the debug registers of the raising thread, arm it again later
-  WatchRearm:=True;
 end;
 
 //Counts a write by an instruction. True for the first write by that instruction.
@@ -1479,6 +1689,13 @@ begin
       FlushSlot(Slots[I]);
       Slots[I].LuaWrites:=0;
     end;
+  for I:=Low(Probes) to High(Probes) do
+  with Probes[I] do
+    if Hits>0 then
+    begin
+      AddWatchEvent(Name,FirstTick,LastTick,IntToStr(Hits)+' hits');
+      Hits:=0;
+    end;
   for I:=1 to High(WatchEvents) do //Insertion sort keeps events of the same tick in order
   begin
     E:=WatchEvents[I];
@@ -1592,12 +1809,6 @@ begin
   WriteLog('Engine ver.: '+IntToStr(GameVer)+#13);
   WriteLog('Game tick: '+IntToStr(GameTick)+#13);
 
-  if MonitorReports<>nil then
-  begin
-    WriteLog(#13+'Monitor:'+#13);
-    WriteReports(MonitorReports);
-  end;
-
   if AVReports<>nil then
   begin
     WriteLog(#13);
@@ -1620,6 +1831,12 @@ begin
       WriteLog(#13);
       WriteReports(WatchReports);
     end;
+    for I:=Low(Probes) to High(Probes) do
+      if Probes[I].Reports<>nil then
+      begin
+        WriteLog(#13+'Callers of probe '+Probes[I].Name+':'+#13);
+        WriteReports(Probes[I].Reports);
+      end;
   end;
 
   if DbgStrs<>nil then
@@ -1629,7 +1846,7 @@ begin
       WriteLog(DbgStrs[I]+#13);
   end;
 
-  if (MonitorReports<>nil) or (AVReports<>nil) or (CPPReports<>nil) or (WatchReports<>nil) then
+  if (Probes<>nil) or (AVReports<>nil) or (CPPReports<>nil) or (WatchReports<>nil) then
   begin
     WriteLog(#13+'DLLs:');
     for I:=Low(DLLs) to High(DLLs) do
@@ -1686,7 +1903,8 @@ begin
     end;
   end;
 
-  ProfilePtr:=HexToUInt(GetCommandLineArg('/p ',True));
+  StartProbes:=SplitArgs(GetCommandLineArg('/p ',True));
+  StartWatches:=SplitArgs(GetCommandLineArg('/w ',True));
 
   Str:=GetCommandLineArg('/log ',False);
   if (Str<>'') and (Str[1]='"') then
@@ -1730,10 +1948,8 @@ begin
               Context.ContextFlags:=CONTEXT_CONTROL or CONTEXT_INTEGER;
               GetThreadContext(hThread,Context);
 
-              Inc(EventsCnt);
-              FindStuff(MonitorReports,Context);
-              SetConsoleTitleW(PChar('Events: '+IntToStr(EventsCnt)+'  Classes: '
-                +IntToStr(Length(MonitorReports))));
+              HandleProbeHit(DWord(ExceptionAddress),Context);
+              SetConsoleTitleW(PChar('Probe hits: '+IntToStr(ProbeHits)));
 
               Context.EFlags:=Context.EFlags or $100; //Set EXCEPTION_SINGLE_STEP
               Context.Eip:=DWord(ExceptionAddress);
@@ -1808,11 +2024,10 @@ begin
       CREATE_PROCESS_DEBUG_EVENT: begin
         ThreadIds:=ThreadIds+[DbgEvent.dwThreadId];
         ReadProcessMemory(PI.hProcess,Pointer($876666),@GameVer,SizeOf(GameVer),BytesT);
-        if ProfilePtr>0 then
-        begin
-          AddSoftBP(Pointer(ProfilePtr),0,[BPSActive]);
-          AddEventReport(MonitorReports,'Profiling: 0x'+UIntToHex(ProfilePtr),'','');
-        end;
+        for I:=Low(StartProbes) to High(StartProbes) do
+          AddProbe(StartProbes[I]);
+        if StartWatches<>nil then
+          ArmAddrWatch(StartWatches);
       end;
       EXIT_PROCESS_DEBUG_EVENT: begin
         ExitCode:=DbgEvent.ExitProcess.dwExitCode;
