@@ -38,7 +38,8 @@ do
         -- Once the probe is hit, this replaces all watched addresses.
         -- FADeepProbeProbe("438310:ecx+474")
         --
-        -- FADeepProbe's "Watch:" section logs each address by game tick, and gives each new writer a numbered report:
+        -- FADeepProbe's "Watch:" section logs each address with its game tick, in the order things happened.
+        -- Each new writer of an address gets a numbered report, up to 8 per address:
         --     0x00438310 0 probe armed, watches ecx+474 on the next hit
         --     0x11502000+0x474 12 armed by probe 0x00438310 (ecx+474)
         --     0x11502000+0x474 120 first write by 0x0128E289, 0x00000004 -> 0x00000000, report 1

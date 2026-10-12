@@ -1130,7 +1130,7 @@ const
   ProbeMarker:UTF8String='FADeepProbe probe ';
   WatchPollMs=250;
   MaxWatchSlots=4; //Debug registers DR0-DR3
-  MaxWatchReports=8;
+  MaxWatchReports=8; //Per watched address
   MaxWatchWriters=32;
   MaxWatchEvents=256;
   LuaStringTT=4;
@@ -1147,14 +1147,18 @@ type
     PollValue:DWord;  //Changed value seen by the last poll, if Polled
     Polled:Boolean;
     LuaWrites,LuaFirstTick,LuaLastTick:DWord;
+    LuaFirstTime:DWord; //GetTickCount of the first ltable.c write
+    ReportCnt:Int32;
   end;
   TWatchWriter=record
     Addr,Eip,Count,FirstTick,LastTick,Value:DWord;
+    FirstTime:DWord; //GetTickCount of the first write
   end;
   //A line of the watch log: address, tick or tick range, message
   TWatchEvent=record
     Name:String;
     FirstTick,LastTick:DWord;
+    Time:DWord; //GetTickCount when it happened, or when its first write or hit happened
     Msg:String;
   end;
 
@@ -1178,7 +1182,8 @@ begin
     Result:=V;
 end;
 
-procedure AddWatchEvent(const Name:String;FirstTick,LastTick:DWord;const Msg:String);
+//Logs an event. Time 0 means now.
+procedure AddWatchEvent(const Name:String;FirstTick,LastTick:DWord;const Msg:String;Time:DWord=0);
 begin
   if Length(WatchEvents)>=MaxWatchEvents then Exit;
   SetLength(WatchEvents,Length(WatchEvents)+1);
@@ -1186,18 +1191,21 @@ begin
   WatchEvents[High(WatchEvents)].FirstTick:=FirstTick;
   WatchEvents[High(WatchEvents)].LastTick:=LastTick;
   WatchEvents[High(WatchEvents)].Msg:=Msg;
+  if Time=0 then Time:=GetTickCount;
+  WatchEvents[High(WatchEvents)].Time:=Time;
 end;
 
 //Moves the write counts of a slot and its writers into the watch log, as one event over all their ticks
 procedure FlushSlot(const S:TWatchSlot);
 Var I:Int32;
-    First,Last:DWord;
+    First,Last,Time:DWord;
     Any:Boolean;
     Str:String;
 begin
   Any:=S.LuaWrites>0;
   First:=S.LuaFirstTick;
   Last:=S.LuaLastTick;
+  Time:=S.LuaFirstTime;
   Str:=#13+'    '+IntToStr(S.LuaWrites)+' by ltable.c';
   I:=0;
   while I<Length(Writers) do
@@ -1207,13 +1215,14 @@ begin
       begin
         if not Any or (FirstTick<First) then First:=FirstTick;
         if not Any or (LastTick>Last) then Last:=LastTick;
+        if not Any or (FirstTime<Time) then Time:=FirstTime;
         Any:=True;
         Str:=Str+#13+'    '+IntToStr(Count)+' by'+StacktraceToStr([PByte(Eip)])+', last value 0x'+UIntToHex(Value);
       end;
       Delete(Writers,I,1);
     end;
   if Any then
-    AddWatchEvent(S.Name,First,Last,'writes:'+Str);
+    AddWatchEvent(S.Name,First,Last,'writes:'+Str,Time);
 end;
 
 //Disarms all watched addresses
@@ -1377,6 +1386,7 @@ type
     Name:String;
     Exprs:TArray<String>; //Watched on the next hit
     Hits,FirstTick,LastTick:DWord;
+    FirstTime:DWord; //GetTickCount of the first hit
     Reports:TArray<TEventReport>;
   end;
 
@@ -1503,7 +1513,11 @@ begin
   Tick:=ReadGameTick;
   with Probes[I] do
   begin
-    if Hits=0 then FirstTick:=Tick;
+    if Hits=0 then
+    begin
+      FirstTick:=Tick;
+      FirstTime:=GetTickCount;
+    end;
     LastTick:=Tick;
     Inc(Hits);
     FindStuff(Reports,C);
@@ -1586,17 +1600,19 @@ begin
   Writers[High(Writers)].Eip:=Eip;
   Writers[High(Writers)].Count:=1;
   Writers[High(Writers)].FirstTick:=Tick;
+  Writers[High(Writers)].FirstTime:=GetTickCount;
   Writers[High(Writers)].LastTick:=Tick;
   Writers[High(Writers)].Value:=Value;
   Result:=True;
 end;
 
 //Reports the first write to a slot's address by an instruction
-procedure ReportWatchWrite(const S:TWatchSlot;const C:TContext;ThreadId,V:DWord);
+procedure ReportWatchWrite(var S:TWatchSlot;const C:TContext;ThreadId,V:DWord);
 Var Str:String;
     Tick:DWord;
 begin
   Inc(WatchReportCnt);
+  Inc(S.ReportCnt);
   Tick:=ReadGameTick;
   AddWatchEvent(S.Name,Tick,Tick,'first write by'+StacktraceToStr([PByte(C.Eip)])+', 0x'+UIntToHex(S.Value)
     +' -> 0x'+UIntToHex(V)+', report '+IntToStr(WatchReportCnt));
@@ -1632,11 +1648,15 @@ begin
       begin
         if (C.Eip>=LTableCodeStart) and (C.Eip<LTableCodeEnd) then
         begin
-          if LuaWrites=0 then LuaFirstTick:=ReadGameTick;
+          if LuaWrites=0 then
+          begin
+            LuaFirstTick:=ReadGameTick;
+            LuaFirstTime:=GetTickCount;
+          end;
           LuaLastTick:=ReadGameTick;
           Inc(LuaWrites);
         end else
-        if AddWriter(Addr,C.Eip,V) and (WatchReportCnt<MaxWatchReports) then
+        if AddWriter(Addr,C.Eip,V) and (ReportCnt<MaxWatchReports) then
           ReportWatchWrite(Slots[I],C,ThreadId,V);
         Value:=V;
       end;
@@ -1678,7 +1698,7 @@ begin
       end;
 end;
 
-//The watch log in order of first tick, one "<address> <tick or ticks> <message>" line per event
+//The watch log in order of time, one "<address> <tick or ticks> <message>" line per event
 function GetWatchLogStr:String;
 Var I,J:Int32;
     E:TWatchEvent;
@@ -1693,14 +1713,16 @@ begin
   with Probes[I] do
     if Hits>0 then
     begin
-      AddWatchEvent(Name,FirstTick,LastTick,IntToStr(Hits)+' hits');
+      AddWatchEvent(Name,FirstTick,LastTick,IntToStr(Hits)+' hits',FirstTime);
       Hits:=0;
     end;
-  for I:=1 to High(WatchEvents) do //Insertion sort keeps events of the same tick in order
+  //Sort by time rather than tick, since ticks don't advance in the menus or while paused.
+  //Insertion sort keeps events of the same time in order.
+  for I:=1 to High(WatchEvents) do
   begin
     E:=WatchEvents[I];
     J:=I-1;
-    while (J>=0) and (WatchEvents[J].FirstTick>E.FirstTick) do
+    while (J>=0) and (WatchEvents[J].Time>E.Time) do
     begin
       WatchEvents[J+1]:=WatchEvents[J];
       Dec(J);

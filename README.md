@@ -4,7 +4,7 @@
 - Collects a lot more information.
 - Can be placed between the client and the game.
 - Protects the game from attaching a debugger.
-- Does not affect performance.
+- Does not affect performance while no probes or watches are set.
 
 ### Usage
 ```
@@ -40,7 +40,7 @@ A probe can also watch addresses computed from the registers on its next hit, gi
 Probing an address again replaces its watch expressions.
 
 ### Report
-The `Watch:` section of the report logs each address by game tick:
+The `Watch:` section of the report logs each address with its game tick, in the order things happened:
 ```
 0x00438310 0 probe armed, watches ecx+474 on the next hit
 0x11502000+0x474 12 armed by probe 0x00438310 (ecx+474)
@@ -50,7 +50,7 @@ The `Watch:` section of the report logs each address by game tick:
     4214 by 0x0128E289, last value 0x00000000
 0x00438310 12-3779 3 hits
 ```
-The first write to a watched address by each instruction gets a numbered report below the log, with the writer's registers, stack, Lua calls and code.
+The first write to a watched address by each instruction gets a numbered report below the log, with the writer's registers, stack, Lua calls and code. Each address gets up to 8 reports; later writers are only counted.
 Lua's table code (`ltable.c`) is only counted, since Lua reuses memory often enough to use up the reports.
 Values that change without a caught write, such as kernel writes, are logged when FADeepProbe polls them.
 The callers of each probe follow the reports.
