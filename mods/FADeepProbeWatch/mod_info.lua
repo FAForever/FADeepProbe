@@ -1,0 +1,16 @@
+name = "FADeepProbe watch example"
+uid = "2be67272-731c-4ced-b3f0-8d5e595e3d71"
+version = 3
+copyright = ""
+description = "Example of asking FADeepProbe to watch memory, so the crash report names whatever writes it. Watches two fields of the cursor's Lua table. Does nothing when the game runs without FADeepProbe."
+author = "FAForever"
+url = "https://github.com/FAForever/FADeepProbe"
+selectable = true
+enabled = true
+exclusive = false
+ui_only = true
+requires = {}
+requiresNames = {}
+conflicts = {}
+before = {}
+after = {}
