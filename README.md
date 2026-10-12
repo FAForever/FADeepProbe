@@ -28,7 +28,7 @@ FA throws Lua errors as C++ exceptions, so FADeepProbe sees the request while th
 Reports appear in the `Watch:` section of the report, with the writer's registers, stack, Lua calls and code, and the table.
 Key tags that change without a reported write, such as kernel writes, are reported when FADeepProbe polls them.
 
-The `mods/FADeepProbeWatch` UI mod watches the addresses where a stray write has been corrupting Lua tables.
+The `mods/FADeepProbeWatch` UI mod is an example of both requests, with functions to copy into your own hooks.
 
 ### Building
 Requires [Free Pascal](https://www.freepascal.org/) 3.2.2 targeting i386-win32. All other compiler settings are in the source.
